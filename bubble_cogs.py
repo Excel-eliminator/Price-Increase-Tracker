@@ -37,6 +37,7 @@ try:
     file_ext = uploaded_file.name.split('.')[-1].lower()
     has_price_data = False
     pi_produk_keys = set()
+    pi_period_dict = {}
 
     # 1. READ DATA WITH MULTI-SHEET EXCEL SUPPORT
     if file_ext == 'xlsx':
@@ -63,11 +64,16 @@ try:
                     r'\.0$', '', regex=True)
                 df_map['Produk_Key'] = df_map['Produk_Key'].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
 
+                # Format Date in Price Increase
+                if 'Price Increase Period' in df_pi.columns:
+                    df_pi['Price Increase Period'] = pd.to_datetime(df_pi['Price Increase Period'], errors='coerce')
+
                 df_pi_mapped = df_pi.merge(df_map, on='Old material number', how='inner')
                 pi_produk_keys = set(df_pi_mapped['Produk_Key'].tolist())
+                pi_period_dict = dict(zip(df_pi_mapped['Produk_Key'], df_pi_mapped['Price Increase Period']))
                 has_price_data = True
     else:
-        # Fallback for old CSV format (no mapping capabilities)
+        # Fallback for old CSV format
         df = pd.read_csv(uploaded_file, sep=';', dtype=str)
         if len(df.columns) == 1:
             uploaded_file.seek(0)
@@ -127,8 +133,13 @@ try:
     if 'Produk_Key' in df.columns:
         df['Produk_Key_Str'] = df['Produk_Key'].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
         df['Price_Increase_Flag'] = df['Produk_Key_Str'].isin(pi_produk_keys)
+        if has_price_data:
+            df['Price_Increase_Period'] = df['Produk_Key_Str'].map(pi_period_dict)
+        else:
+            df['Price_Increase_Period'] = pd.NaT
     else:
         df['Price_Increase_Flag'] = False
+        df['Price_Increase_Period'] = pd.NaT
 
     # ==========================================
     # SETTINGS: PERIOD & METRIC
@@ -176,29 +187,31 @@ try:
         Total_COGS_All=('Total COGS', 'sum'),
         Selected_COGS=(cogs_selector, 'sum'),
         Total_Qty=('Quantity', 'sum'),
-        Price_Increase=('Price_Increase_Flag', 'max')  # Cap True jika ada transaksi SKU bersangkutan
+        Price_Increase=('Price_Increase_Flag', 'max'),
+        Price_Increase_Period=('Price_Increase_Period', 'first'),
+        Produk_Key_Str=('Produk_Key_Str', 'first')
     ).reset_index()
 
-    # 🧹 HARD-FILTER OUTLIER: Keluarkan SKU tester/anomali dengan nilai < Rp 1
-    df_sku = df_sku[
+    # 🧹 HARD-FILTER OUTLIER
+    df_sku_valid = df_sku[
         (df_sku['Total_Gross_Sales'] >= 1) &
         (df_sku['Total_COGS_Reg'] >= 1) &
         (df_sku['Total_COGS_All'] >= 1)
         ].copy()
 
-    if df_sku.empty:
+    if df_sku_valid.empty:
         st.warning("⚠️ Tidak ada data valid (Gross Sales, COGS Regular, & Total COGS >= Rp 1) pada periode ini.")
         st.stop()
 
-    # Calculate COGS % and text tags
-    df_sku['COGS (%)'] = (df_sku['Selected_COGS'] / df_sku['Total_Gross_Sales']) * 100
-    df_sku['Bubble_Size'] = df_sku['Total_Qty'].abs().replace(0, 1)
-    df_sku['Price_Increase_Label'] = np.where(df_sku['Price_Increase'], 'Naik Harga', 'Harga Tetap')
+    # Formatting
+    df_sku_valid['COGS (%)'] = (df_sku_valid['Selected_COGS'] / df_sku_valid['Total_Gross_Sales']) * 100
+    df_sku_valid['Bubble_Size'] = df_sku_valid['Total_Qty'].abs().replace(0, 1)
+    df_sku_valid['Price_Increase_Label'] = np.where(df_sku_valid['Price_Increase'], 'Naik Harga', 'Harga Tetap')
+    df_sku_valid['Periode Naik Harga'] = df_sku_valid['Price_Increase_Period'].dt.strftime('%Y-%m-%d').fillna('-')
 
-    # 🌟 CUSTOMDATA TEXT STRINGS FOR TOOLTIP BUG FIX
-    df_sku['Format_Sales'] = df_sku['Total_Gross_Sales'].apply(lambda x: f"Rp {x:,.0f}")
-    df_sku['Format_COGS'] = df_sku['Selected_COGS'].apply(lambda x: f"Rp {x:,.0f}")
-    df_sku['Format_Qty'] = df_sku['Total_Qty'].apply(lambda x: f"{x:,.0f} Pcs")
+    df_sku_valid['Format_Sales'] = df_sku_valid['Total_Gross_Sales'].apply(lambda x: f"Rp {x:,.0f}")
+    df_sku_valid['Format_COGS'] = df_sku_valid['Selected_COGS'].apply(lambda x: f"Rp {x:,.0f}")
+    df_sku_valid['Format_Qty'] = df_sku_valid['Total_Qty'].apply(lambda x: f"{x:,.0f} Pcs")
 
     # ==========================================
     # SMART-SCALING & OUTLIER CONTROL
@@ -230,14 +243,13 @@ try:
     st.info(
         "💡 **INFO:** The X and Y axes use the dynamic Midpoint value as the absolute center point based on your custom Low and High thresholds. The Center lines are marked in Red.")
 
-    normal_x_df = df_sku[df_sku['Total_Gross_Sales'] >= min_outlier_limit_x]
-    robust_avg_x = normal_x_df['Total_Gross_Sales'].mean() if not normal_x_df.empty else df_sku[
+    normal_x_df = df_sku_valid[df_sku_valid['Total_Gross_Sales'] >= min_outlier_limit_x]
+    robust_avg_x = normal_x_df['Total_Gross_Sales'].mean() if not normal_x_df.empty else df_sku_valid[
         'Total_Gross_Sales'].mean()
     if pd.isna(robust_avg_x) or robust_avg_x <= 0: robust_avg_x = 1000000.0
 
-    actual_avg_y = (df_sku['Selected_COGS'].sum() / df_sku['Total_Gross_Sales'].sum() * 100) if df_sku[
-                                                                                                    'Total_Gross_Sales'].sum() > 0 else \
-    df_sku['COGS (%)'].mean()
+    actual_avg_y = (df_sku_valid['Selected_COGS'].sum() / df_sku_valid['Total_Gross_Sales'].sum() * 100) if \
+    df_sku_valid['Total_Gross_Sales'].sum() > 0 else df_sku_valid['COGS (%)'].mean()
     if pd.isna(actual_avg_y) or actual_avg_y <= 0: actual_avg_y = 50.0
 
     def_x_low = robust_avg_x * 0.66
@@ -275,28 +287,30 @@ try:
     b8_id = 'Box 8 (Med COGS, High Sales)'
     b9_id = 'Box 9 (Low COGS, High Sales)'
 
-    conditions_9box = [
-        (df_sku['COGS (%)'] > y_high_val) & (df_sku['Total_Gross_Sales'] < x_low_val),
-        (df_sku['COGS (%)'] >= y_low_val) & (df_sku['COGS (%)'] <= y_high_val) & (
-                    df_sku['Total_Gross_Sales'] < x_low_val),
-        (df_sku['COGS (%)'] < y_low_val) & (df_sku['Total_Gross_Sales'] < x_low_val),
-        (df_sku['COGS (%)'] > y_high_val) & (df_sku['Total_Gross_Sales'] >= x_low_val) & (
-                    df_sku['Total_Gross_Sales'] <= x_high_val),
-        (df_sku['COGS (%)'] >= y_low_val) & (df_sku['COGS (%)'] <= y_high_val) & (
-                    df_sku['Total_Gross_Sales'] >= x_low_val) & (df_sku['Total_Gross_Sales'] <= x_high_val),
-        (df_sku['COGS (%)'] < y_low_val) & (df_sku['Total_Gross_Sales'] >= x_low_val) & (
-                    df_sku['Total_Gross_Sales'] <= x_high_val),
-        (df_sku['COGS (%)'] > y_high_val) & (df_sku['Total_Gross_Sales'] > x_high_val),
-        (df_sku['COGS (%)'] >= y_low_val) & (df_sku['COGS (%)'] <= y_high_val) & (
-                    df_sku['Total_Gross_Sales'] > x_high_val),
-        (df_sku['COGS (%)'] < y_low_val) & (df_sku['Total_Gross_Sales'] > x_high_val)
-    ]
-    df_sku['Dynamic 9-Box Category'] = np.select(conditions_9box,
-                                                 [b1_id, b2_id, b3_id, b4_id, b5_id, b6_id, b7_id, b8_id, b9_id],
-                                                 default=b5_id)
 
-    box_counts = df_sku['Dynamic 9-Box Category'].value_counts().to_dict()
-    total_items = len(df_sku)
+    def assign_9box(df_target):
+        conditions = [
+            (df_target['COGS (%)'] > y_high_val) & (df_target['Total_Gross_Sales'] < x_low_val),
+            (df_target['COGS (%)'] >= y_low_val) & (df_target['COGS (%)'] <= y_high_val) & (
+                        df_target['Total_Gross_Sales'] < x_low_val),
+            (df_target['COGS (%)'] < y_low_val) & (df_target['Total_Gross_Sales'] < x_low_val),
+            (df_target['COGS (%)'] > y_high_val) & (df_target['Total_Gross_Sales'] >= x_low_val) & (
+                        df_target['Total_Gross_Sales'] <= x_high_val),
+            (df_target['COGS (%)'] >= y_low_val) & (df_target['COGS (%)'] <= y_high_val) & (
+                        df_target['Total_Gross_Sales'] >= x_low_val) & (df_target['Total_Gross_Sales'] <= x_high_val),
+            (df_target['COGS (%)'] < y_low_val) & (df_target['Total_Gross_Sales'] >= x_low_val) & (
+                        df_target['Total_Gross_Sales'] <= x_high_val),
+            (df_target['COGS (%)'] > y_high_val) & (df_target['Total_Gross_Sales'] > x_high_val),
+            (df_target['COGS (%)'] >= y_low_val) & (df_target['COGS (%)'] <= y_high_val) & (
+                        df_target['Total_Gross_Sales'] > x_high_val),
+            (df_target['COGS (%)'] < y_low_val) & (df_target['Total_Gross_Sales'] > x_high_val)
+        ]
+        return np.select(conditions, [b1_id, b2_id, b3_id, b4_id, b5_id, b6_id, b7_id, b8_id, b9_id], default=b5_id)
+
+
+    df_sku_valid['Dynamic 9-Box Category'] = assign_9box(df_sku_valid)
+    box_counts = df_sku_valid['Dynamic 9-Box Category'].value_counts().to_dict()
+    total_items = len(df_sku_valid)
 
 
     # Scaling function
@@ -307,17 +321,17 @@ try:
             return x_high_val + (v - x_high_val) * scale_factor_x
 
 
-    df_sku['X_Plot'] = df_sku['Total_Gross_Sales'].apply(apply_custom_x_scale)
+    df_sku_valid['X_Plot'] = df_sku_valid['Total_Gross_Sales'].apply(apply_custom_x_scale)
 
-    # Calculate global boundaries
-    x_min_raw = df_sku['Total_Gross_Sales'].min()
-    x_max_raw = df_sku['Total_Gross_Sales'].max()
+    # Global boundaries setup
+    x_min_raw = df_sku_valid['Total_Gross_Sales'].min()
+    x_max_raw = df_sku_valid['Total_Gross_Sales'].max()
     x_span_raw = x_max_raw - x_min_raw if x_max_raw != x_min_raw else robust_avg_x
     plot_x_min = x_min_raw - (abs(x_span_raw) * 0.05) if x_min_raw >= 0 else x_min_raw - (abs(x_span_raw) * 0.05)
     plot_x_max = x_max_raw + (abs(x_span_raw) * 0.05)
 
-    y_min_raw = df_sku['COGS (%)'].min()
-    y_max_raw = df_sku['COGS (%)'].max()
+    y_min_raw = df_sku_valid['COGS (%)'].min()
+    y_max_raw = df_sku_valid['COGS (%)'].max()
     y_span_raw = y_max_raw - y_min_raw if y_max_raw != y_min_raw else 100.0
     plot_y_min = y_min_raw - (y_span_raw * 0.05)
     plot_y_max = max(y_max_raw, y_high_val * 1.5) + (y_span_raw * 0.05)
@@ -330,7 +344,10 @@ try:
 
 
     # Helper function to inject common annotations/lines
-    def apply_common_layout(fig):
+    def apply_common_layout(fig, custom_box_counts=None):
+        b_counts = custom_box_counts if custom_box_counts is not None else box_counts
+        tot_items = sum(b_counts.values()) if custom_box_counts is not None else total_items
+
         fig.add_vline(x=apply_custom_x_scale(x_low_val), line_dash="dash", line_color="black", opacity=0.7,
                       annotation_text=f" Low ({fmt_idr(x_low_val)})", annotation_position="top left")
         fig.add_vline(x=apply_custom_x_scale(x_high_val), line_dash="dash", line_color="black", opacity=0.7,
@@ -339,9 +356,11 @@ try:
                       annotation_text=f"Low ({y_low_val:.1f}%)", annotation_position="bottom right")
         fig.add_hline(y=y_high_val, line_dash="dash", line_color="black", opacity=0.7,
                       annotation_text=f"High ({y_high_val:.1f}%)", annotation_position="top right")
+
+        # Center Line Red
         fig.add_vline(x=apply_custom_x_scale(mid_x), line_dash="dot", line_color="red", opacity=0.6,
                       annotation_text=f" ← Center X ({fmt_idr(mid_x)})", annotation_font_color="red",
-                      annotation_position="top right")
+                      annotation_position="bottom right")
         fig.add_hline(y=mid_y, line_dash="dot", line_color="red", opacity=0.6,
                       annotation_text=f"Center Y ({mid_y:.1f}%)", annotation_position="top right",
                       annotation_font_color="red")
@@ -349,7 +368,7 @@ try:
         mapped_x_low, mapped_x_high = apply_custom_x_scale(x_low_val), apply_custom_x_scale(x_high_val)
         mapped_plot_x_min, mapped_plot_x_max = apply_custom_x_scale(plot_x_min), apply_custom_x_scale(plot_x_max)
 
-        box_coords = {
+        b_coords = {
             b1_id: {'x': (mapped_plot_x_min + mapped_x_low) / 2, 'y': (y_high_val + plot_y_max) / 2, 'id': 'B1'},
             b2_id: {'x': (mapped_plot_x_min + mapped_x_low) / 2, 'y': (y_low_val + y_high_val) / 2, 'id': 'B2'},
             b3_id: {'x': (mapped_plot_x_min + mapped_x_low) / 2, 'y': (plot_y_min + y_low_val) / 2, 'id': 'B3'},
@@ -361,11 +380,11 @@ try:
             b9_id: {'x': (mapped_x_high + mapped_plot_x_max) / 2, 'y': (plot_y_min + y_low_val) / 2, 'id': 'B9'}
         }
 
-        for box_name, coords in box_coords.items():
-            if box_counts.get(box_name, 0) > 0:
+        for box_name, coords in b_coords.items():
+            if b_counts.get(box_name, 0) > 0:
                 fig.add_annotation(
                     x=coords['x'], y=coords['y'], xref="x", yref="y",
-                    text=f"<span style='color:#1f2937;'><b>{coords['id']}</b></span><br><b>{box_counts[box_name]} SKUs</b>",
+                    text=f"<span style='color:#1f2937;'><b>{coords['id']}</b></span><br><b>{b_counts[box_name]} SKUs</b>",
                     showarrow=False, font=dict(size=13, color="#374151"),
                     bgcolor="rgba(255, 255, 255, 0.85)", bordercolor="rgba(15, 23, 42, 0.3)",
                     borderwidth=1, borderpad=4
@@ -373,7 +392,7 @@ try:
 
         fig.add_annotation(
             x=0.98, y=0.98, xref="paper", yref="paper",
-            text=f"<b>TOTAL:<br>{total_items} SKUs</b>", showarrow=False,
+            text=f"<b>TOTAL:<br>{tot_items} SKUs</b>", showarrow=False,
             font=dict(size=13, color="white"), bgcolor="#374151",
             bordercolor="black", borderwidth=1, borderpad=5
         )
@@ -394,12 +413,7 @@ try:
         return fig
 
 
-    # ==========================================
-    # MULTI-TAB CHARTS RENDER
-    # ==========================================
-    st.markdown("---")
-    tab_main, tab_pi = st.tabs(["📊 Main COGS 9-Box", "📈 Price Increase Tracker"])
-
+    # Configs
     hover_conf = {
         'Format_Sales': True,
         'Format_COGS': True,
@@ -411,15 +425,22 @@ try:
         'X_Plot': False
     }
 
+    color_map_main = {
+        b1_id: '#c03d32', b2_id: '#d89f0e', b3_id: '#3871b6',
+        b4_id: '#c03d32', b5_id: '#d89f0e', b6_id: '#3871b6',
+        b7_id: '#d89f0e', b8_id: '#319b5e', b9_id: '#319b5e'
+    }
+
+    # ==========================================
+    # MULTI-TAB CHARTS RENDER
+    # ==========================================
+    st.markdown("---")
+    tab_main, tab_pi = st.tabs(["📊 Main COGS 9-Box", "📈 Price Increase Tracker"])
+
     # ----- TAB 1: MAIN MATRIX -----
     with tab_main:
-        color_map_main = {
-            b1_id: '#c03d32', b2_id: '#d89f0e', b3_id: '#3871b6',
-            b4_id: '#c03d32', b5_id: '#d89f0e', b6_id: '#3871b6',
-            b7_id: '#d89f0e', b8_id: '#319b5e', b9_id: '#319b5e'
-        }
         fig_main = px.scatter(
-            df_sku, x='X_Plot', y='COGS (%)', size='Bubble_Size',
+            df_sku_valid, x='X_Plot', y='COGS (%)', size='Bubble_Size',
             color='Dynamic 9-Box Category', color_discrete_map=color_map_main,
             hover_name='Product Name', hover_data=hover_conf,
             labels={'Format_Sales': 'Gross Sales', 'Format_COGS': cogs_selector, 'Format_Qty': 'Quantity'},
@@ -440,42 +461,274 @@ try:
                 'Harga Tetap': '#3871b6'  # Biru
             }
             fig_pi = px.scatter(
-                df_sku, x='X_Plot', y='COGS (%)', size='Bubble_Size',
+                df_sku_valid, x='X_Plot', y='COGS (%)', size='Bubble_Size',
                 color='Price_Increase_Label', color_discrete_map=color_map_pi,
                 hover_name='Product Name', hover_data=hover_conf,
                 labels={'Format_Sales': 'Gross Sales', 'Format_COGS': cogs_selector, 'Format_Qty': 'Quantity',
                         'Price_Increase_Label': 'Status Harga'},
-                title=f"Price Increase Matrix: {cogs_selector} (%) vs Gross Sales ({chart_period_title})",
+                title=f"Price Increase Tracker: {cogs_selector} (%) vs Gross Sales ({chart_period_title})",
                 size_max=60, render_mode='svg'
             )
             fig_pi = apply_common_layout(fig_pi)
 
-            # Hitung jumlah SKU berdasarkan status harga untuk label
-            count_naik = df_sku[df_sku['Price_Increase_Label'] == 'Naik Harga'].shape[0]
-            count_tetap = df_sku[df_sku['Price_Increase_Label'] == 'Harga Tetap'].shape[0]
+            count_naik = df_sku_valid[df_sku_valid['Price_Increase_Label'] == 'Naik Harga'].shape[0]
+            count_tetap = df_sku_valid[df_sku_valid['Price_Increase_Label'] == 'Harga Tetap'].shape[0]
 
-            # Tambahkan anotasi khusus di pojok kiri atas
             fig_pi.add_annotation(
                 x=0.01, y=0.98, xref="paper", yref="paper",
                 text=f"<b>Status Harga:</b><br><span style='color:#319b5e'>Naik Harga: {count_naik} SKUs</span><br><span style='color:#3871b6'>Harga Tetap: {count_tetap} SKUs</span>",
-                showarrow=False,
-                font=dict(size=13, color="#1f2937"),
-                bgcolor="rgba(255, 255, 255, 0.95)",
-                bordercolor="rgba(15, 23, 42, 0.3)",
-                borderwidth=1, borderpad=6,
-                align="left"
+                showarrow=False, font=dict(size=13, color="#1f2937"),
+                bgcolor="rgba(255, 255, 255, 0.95)", bordercolor="rgba(15, 23, 42, 0.3)",
+                borderwidth=1, borderpad=6, align="left"
             )
-
             st.plotly_chart(fig_pi, use_container_width=True)
+
+            # MISSING SKU DETECTOR
+            master_pi_keys = set(pi_produk_keys)
+            plotted_pi_keys = set(df_sku_valid[df_sku_valid['Price_Increase']]['Produk_Key_Str'].dropna())
+            missing_pi_keys = master_pi_keys - plotted_pi_keys
+
+            if missing_pi_keys:
+                missing_df = df_pi_mapped[df_pi_mapped['Produk_Key'].isin(missing_pi_keys)][
+                    ['Old material number', 'Produk_Key', 'Product Name', 'Price Increase Period']].copy()
+                missing_df['Price Increase Period'] = missing_df['Price Increase Period'].dt.strftime(
+                    '%Y-%m-%d').fillna('-')
+
+                keys_in_raw = set(df_filtered['Produk_Key_Str'].dropna())
+                keys_in_sku_pre_filter = set(df_sku['Produk_Key_Str'].dropna())
+
+
+                def get_reason(k):
+                    if k not in keys_in_raw:
+                        return "Bolos (Tidak ada transaksi di periode terpilih)"
+                    elif k not in keys_in_sku_pre_filter:
+                        return "Terfilter (Nilai Sales/COGS < Rp 1)"
+                    else:
+                        return "Terfilter (Nilai Sales/COGS < Rp 1)"
+
+
+                missing_df['Alasan Hilang'] = missing_df['Produk_Key'].apply(get_reason)
+
+                st.markdown(
+                    f"**⚠️ Terdapat {len(missing_pi_keys)} SKU Naik Harga yang tidak ter-plot ke dalam grafik utama:**")
+
+                # Excel Download for Missing SKUs
+                col_mis1, col_mis2 = st.columns([1, 4])
+                with col_mis1:
+                    buffer_missing = io.BytesIO()
+                    with pd.ExcelWriter(buffer_missing, engine='openpyxl') as writer:
+                        missing_df.to_excel(writer, index=False, sheet_name='Missing_SKUs')
+                        worksheet_mis = writer.sheets['Missing_SKUs']
+                        for col in worksheet_mis.columns:
+                            max_len = max([len(str(cell.value)) if cell.value is not None else 0 for cell in col])
+                            worksheet_mis.column_dimensions[col[0].column_letter].width = max_len + 2
+                    st.download_button(
+                        label="📥 Download Missing SKUs (Excel)",
+                        data=buffer_missing.getvalue(),
+                        file_name=f"Missing_SKUs_Price_Increase_{chart_period_title.replace(' ', '_')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                st.dataframe(missing_df, use_container_width=True, hide_index=True)
+
+            # ==========================================
+            # BEFORE & AFTER TOGGLE CHART (APPLES-TO-APPLES)
+            # ==========================================
+            st.markdown("---")
+            st.markdown("#### 🔄 Before & After Price Increase Analysis")
+            st.info(
+                "Visualisasi khusus membandingkan pergerakan performa **SKU yang sama persis** (Apples-to-Apples). Sistem membandingkan agregat transaksi sebelum vs sesudah tanggal naik harga untuk SKU yang aktif di kedua periode tersebut.")
+
+            toggle_mode = st.radio("Pilih Mode Timeline:", ["Before Price Increase", "After Price Increase"],
+                                   horizontal=True)
+
+            df_pi_trx = df_filtered[df_filtered['Price_Increase_Flag'] == True].copy()
+
+
+            # Fungsi Agregasi & Filter per Periode
+            def get_agg_valid(df_sub):
+                if df_sub.empty: return pd.DataFrame()
+                df_agg = df_sub.groupby('Product Name').agg(
+                    Total_Gross_Sales=('Calc_Gross_Sales', 'sum'),
+                    Total_COGS_Reg=('COGS_Regular', 'sum'),
+                    Total_COGS_All=('Total COGS', 'sum'),
+                    Selected_COGS=(cogs_selector, 'sum'),
+                    Total_Qty=('Quantity', 'sum')
+                ).reset_index()
+                return df_agg[
+                    (df_agg['Total_Gross_Sales'] >= 1) &
+                    (df_agg['Total_COGS_Reg'] >= 1) &
+                    (df_agg['Total_COGS_All'] >= 1)
+                    ].copy()
+
+
+            df_raw_before = df_pi_trx[df_pi_trx['Date'] < df_pi_trx['Price_Increase_Period']]
+            df_raw_after = df_pi_trx[df_pi_trx['Date'] >= df_pi_trx['Price_Increase_Period']]
+
+            df_before_agg = get_agg_valid(df_raw_before)
+            df_after_agg = get_agg_valid(df_raw_after)
+
+            if df_before_agg.empty or df_after_agg.empty:
+                st.warning("⚠️ Tidak cukup data untuk melakukan perbandingan Before-After (salah satu periode kosong).")
+            else:
+                # 🍎 MURNI APPLES-TO-APPLES COMPARISON (INTERSECTION) 🍎
+                common_skus = set(df_before_agg['Product Name']).intersection(set(df_after_agg['Product Name']))
+
+                # Proses data BEFORE
+                df_before_agg['COGS (%)'] = (df_before_agg['Selected_COGS'] / df_before_agg['Total_Gross_Sales']) * 100
+                df_before_agg['Dynamic 9-Box Category'] = assign_9box(df_before_agg)
+
+                # Proses data AFTER
+                df_after_agg['COGS (%)'] = (df_after_agg['Selected_COGS'] / df_after_agg['Total_Gross_Sales']) * 100
+                df_after_agg['Dynamic 9-Box Category'] = assign_9box(df_after_agg)
+
+                if toggle_mode == "Before Price Increase":
+                    df_ba = df_before_agg[df_before_agg['Product Name'].isin(common_skus)].copy()
+                    chart_title_ba = "BEFORE Price Increase"
+                else:
+                    df_ba = df_after_agg[df_after_agg['Product Name'].isin(common_skus)].copy()
+                    chart_title_ba = "AFTER Price Increase"
+
+                if df_ba.empty:
+                    st.warning(
+                        f"Setelah mencari irisan SKU yang aktif di kedua periode, tidak ada data tersisa untuk {chart_title_ba}.")
+                else:
+                    df_ba['Bubble_Size'] = df_ba['Total_Qty'].abs().replace(0, 1)
+                    df_ba['Price_Increase_Label'] = 'Naik Harga'
+
+                    df_ba['Format_Sales'] = df_ba['Total_Gross_Sales'].apply(lambda x: f"Rp {x:,.0f}")
+                    df_ba['Format_COGS'] = df_ba['Selected_COGS'].apply(lambda x: f"Rp {x:,.0f}")
+                    df_ba['Format_Qty'] = df_ba['Total_Qty'].apply(lambda x: f"{x:,.0f} Pcs")
+                    df_ba['X_Plot'] = df_ba['Total_Gross_Sales'].apply(apply_custom_x_scale)
+
+                    b_counts_ba = df_ba['Dynamic 9-Box Category'].value_counts().to_dict()
+
+                    fig_ba = px.scatter(
+                        df_ba, x='X_Plot', y='COGS (%)', size='Bubble_Size',
+                        color='Dynamic 9-Box Category', color_discrete_map=color_map_main,
+                        hover_name='Product Name', hover_data=hover_conf,
+                        labels={'Format_Sales': 'Gross Sales', 'Format_COGS': cogs_selector, 'Format_Qty': 'Quantity'},
+                        title=f"{chart_title_ba} Matrix: {cogs_selector} (%) vs Gross Sales | Total Terkalkulasi: {len(df_ba)} SKUs Apples-to-Apples",
+                        size_max=60, render_mode='svg'
+                    )
+
+                    fig_ba = apply_common_layout(fig_ba, custom_box_counts=b_counts_ba)
+                    st.plotly_chart(fig_ba, use_container_width=True)
+
+                    # 🧭 SKU MIGRATION TRACKER TABLE
+                    st.markdown("#### 🧭 SKU Migration Tracker")
+                    st.caption(
+                        "Detail pergerakan kotak (Box) masing-masing SKU dari sebelum naik harga menjadi setelah naik harga.")
+
+                    # Merge data Before dan After khusus untuk SKU yang masuk irisan
+                    df_mig_before = df_before_agg[df_before_agg['Product Name'].isin(common_skus)][
+                        ['Product Name', 'Total_Gross_Sales', 'COGS (%)', 'Dynamic 9-Box Category']].copy()
+                    df_mig_after = df_after_agg[df_after_agg['Product Name'].isin(common_skus)][
+                        ['Product Name', 'Total_Gross_Sales', 'COGS (%)', 'Dynamic 9-Box Category']].copy()
+
+                    df_migration = pd.merge(df_mig_before, df_mig_after, on='Product Name',
+                                            suffixes=(' (Before)', ' (After)'))
+
+
+                    # Fungsi untuk nentuin status migrasi
+                    def get_migration_status(row):
+                        box_b = row['Dynamic 9-Box Category (Before)'].split(' ')[1]
+                        box_a = row['Dynamic 9-Box Category (After)'].split(' ')[1]
+                        if box_b == box_a:
+                            return f"Tetap di Box {box_b}"
+                        else:
+                            return f"Pindah: Box {box_b} ➡️ Box {box_a}"
+
+
+                    df_migration['Status Pergerakan'] = df_migration.apply(get_migration_status, axis=1)
+
+                    # Rapihin kolom untuk display
+                    df_migration = df_migration[[
+                        'Product Name', 'Status Pergerakan',
+                        'Dynamic 9-Box Category (Before)', 'Dynamic 9-Box Category (After)',
+                        'Total_Gross_Sales (Before)', 'Total_Gross_Sales (After)',
+                        'COGS (%) (Before)', 'COGS (%) (After)'
+                    ]].sort_values('Status Pergerakan')
+
+                    # Excel Download for Migration Tracker
+                    col_mig1, col_mig2 = st.columns([1, 4])
+                    with col_mig1:
+                        buffer_mig = io.BytesIO()
+                        with pd.ExcelWriter(buffer_mig, engine='openpyxl') as writer:
+                            df_migration.to_excel(writer, index=False, sheet_name='Migration_Tracker')
+                            ws_mig = writer.sheets['Migration_Tracker']
+                            for col in ws_mig.columns:
+                                max_len = max([len(str(cell.value)) if cell.value is not None else 0 for cell in col])
+                                ws_mig.column_dimensions[col[0].column_letter].width = max_len + 2
+                        st.download_button(
+                            label="📥 Download Migration Tracker (Excel)",
+                            data=buffer_mig.getvalue(),
+                            file_name=f"SKU_Migration_Tracker_{chart_period_title.replace(' ', '_')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            type="primary"
+                        )
+
+                    st.dataframe(
+                        df_migration.style.format({
+                            'Total_Gross_Sales (Before)': 'Rp {:,.0f}',
+                            'Total_Gross_Sales (After)': 'Rp {:,.0f}',
+                            'COGS (%) (Before)': '{:.2f}%',
+                            'COGS (%) (After)': '{:.2f}%'
+                        }),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    # 📉 SKU DROP-OFF (Bolosan) TABLE
+                    lost_skus = set(df_before_agg['Product Name']) - set(df_after_agg['Product Name'])
+                    if lost_skus:
+                        st.markdown("---")
+                        st.markdown("#### 📉 SKU Drop-off (Hilang Setelah Naik Harga)")
+                        st.caption(
+                            "Daftar SKU yang memiliki penjualan sebelum naik harga, namun **TIDAK ADA** penjualan (atau terfilter < Rp 1) setelah harga dinaikkan.")
+
+                        df_lost = df_before_agg[df_before_agg['Product Name'].isin(lost_skus)].copy()
+                        df_lost = df_lost[['Product Name', 'Total_Gross_Sales', 'COGS (%)', 'Dynamic 9-Box Category',
+                                           'Total_Qty']].sort_values('Total_Gross_Sales', ascending=False)
+
+                        # Excel Download for SKU Drop-off
+                        col_lost1, col_lost2 = st.columns([1, 4])
+                        with col_lost1:
+                            buffer_lost = io.BytesIO()
+                            with pd.ExcelWriter(buffer_lost, engine='openpyxl') as writer:
+                                df_lost.to_excel(writer, index=False, sheet_name='Lost_SKUs')
+                                ws_lost = writer.sheets['Lost_SKUs']
+                                for col in ws_lost.columns:
+                                    max_len = max(
+                                        [len(str(cell.value)) if cell.value is not None else 0 for cell in col])
+                                    ws_lost.column_dimensions[col[0].column_letter].width = max_len + 2
+                            st.download_button(
+                                label="📥 Download SKU Drop-off (Excel)",
+                                data=buffer_lost.getvalue(),
+                                file_name=f"SKU_DropOff_After_Price_Increase_{chart_period_title.replace(' ', '_')}.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                type="primary"
+                            )
+
+                        st.dataframe(
+                            df_lost.style.format({
+                                'Total_Gross_Sales': 'Rp {:,.0f}',
+                                'COGS (%)': '{:.2f}%',
+                                'Total_Qty': '{:,.0f} Pcs'
+                            }),
+                            use_container_width=True,
+                            hide_index=True
+                        )
 
     # ==========================================
     # DATA TABLE & EXPORT
     # ==========================================
+    st.markdown("---")
     st.markdown("### 📋 SKU Details")
 
     # Clean UI DataFrame
-    df_display = df_sku.drop(
-        columns=['Bubble_Size', 'X_Plot', 'Format_Sales', 'Format_COGS', 'Format_Qty', 'Price_Increase']).sort_values(
+    drop_cols = ['Bubble_Size', 'X_Plot', 'Format_Sales', 'Format_COGS', 'Format_Qty', 'Price_Increase',
+                 'Produk_Key_Str', 'Price_Increase_Period']
+    df_display = df_sku_valid.drop(columns=[c for c in drop_cols if c in df_sku_valid.columns]).sort_values(
         'Total_Gross_Sales', ascending=False)
 
     col_dl1, col_dl2 = st.columns([1, 4])
