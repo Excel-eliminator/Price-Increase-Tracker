@@ -95,8 +95,9 @@ try:
             return 0.0
 
 
-    # Ensure required columns exist
-    req_cols = ['Date', 'Product Name', 'Gross Sales', 'Return', 'COGS_Regular', 'Total COGS', 'Quantity']
+    # Ensure required columns exist (Modified for the new Compact Structure)
+    req_cols = ['Month', 'Year', 'Product Name', 'Gross Sales', 'Return', 'COGS_Regular', 'Total COGS', 'Quantity',
+                'Market']
     missing_cols = [c for c in req_cols if c not in df.columns]
 
     if missing_cols:
@@ -110,22 +111,28 @@ try:
     df['Total COGS'] = df['Total COGS'].apply(clean_currency)
     df['Quantity'] = df['Quantity'].apply(clean_currency)
 
+    # Handle Market Column
+    df['Market'] = df['Market'].fillna('Unknown').astype(str).str.strip()
+
     # Define Gross Sales
     df['Calc_Gross_Sales'] = df['Gross Sales'] + df['Return']
 
-    # 2. PARSE DATE & FILTER JAN 2026 ONWARDS
-    if pd.api.types.is_datetime64_any_dtype(df['Date']):
-        df['Date'] = pd.to_datetime(df['Date'])
-    else:
-        df['Date'] = pd.to_datetime(df['Date'], format='%d/%m/%Y', errors='coerce')
+    # 2. PARSE DATE FROM 'MONTH' AND 'YEAR' COLUMNS
+    df['Year_Str'] = df['Year'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    df['Month_Str'] = df['Month'].astype(str).str.strip()
 
+    # Jahit Bulan dan Tahun jadi format Datetime (contoh: "August 2026")
+    df['Date'] = pd.to_datetime(df['Month_Str'] + ' ' + df['Year_Str'], format='%B %Y', errors='coerce')
+
+    # Buang baris yang bulannya kosong/tidak terbaca
+    df = df.dropna(subset=['Date'])
     df = df[df['Date'] >= '2026-01-01']
 
     if df.empty:
-        st.warning("⚠️ Tidak ada data transaksi mulai dari Januari 2026 di file ini.")
+        st.warning("⚠️ Tidak ada data transaksi valid mulai dari Januari 2026 di file ini.")
         st.stop()
 
-    # Map periods
+    # Map periods back to standard format for the UI
     df['Month_Year'] = df['Date'].dt.strftime('%B %Y')
     df['YYYYMM'] = df['Date'].dt.strftime('%Y%m')
 
@@ -142,12 +149,12 @@ try:
         df['Price_Increase_Period'] = pd.NaT
 
     # ==========================================
-    # SETTINGS: PERIOD & METRIC
+    # SETTINGS: PERIOD, METRIC & MARKET
     # ==========================================
     st.markdown("---")
     st.markdown("### ⚙️ Evaluation Settings")
 
-    col_set1, col_set2, col_set3 = st.columns(3)
+    col_set1, col_set2, col_set3, col_set4 = st.columns(4)
 
     with col_set1:
         cogs_selector = st.selectbox(
@@ -178,6 +185,15 @@ try:
             df_filtered = df[df['YYYYMM'] <= selected_yyyymm].copy()
             chart_period_title = f"YTD (Jan 2026 - {selected_month.split(' ')[0]})"
 
+    with col_set4:
+        # Market Filter Selection
+        market_list = ["All Markets"] + sorted([m for m in df['Market'].unique() if m != 'Unknown'])
+        selected_market = st.selectbox("Select Market:", market_list)
+
+        if selected_market != "All Markets":
+            df_filtered = df_filtered[df_filtered['Market'] == selected_market].copy()
+            chart_period_title += f" | {selected_market}"
+
     # ==========================================
     # AGGREGATE DATA PER SKU & HARD-FILTER
     # ==========================================
@@ -200,25 +216,16 @@ try:
         ].copy()
 
     if df_sku_valid.empty:
-        st.warning("⚠️ Tidak ada data valid (Gross Sales, COGS Regular, & Total COGS >= Rp 1) pada periode ini.")
+        st.warning(
+            f"⚠️ Tidak ada data valid (Gross Sales, COGS Regular, & Total COGS >= Rp 1) pada Market & Periode terpilih.")
         st.stop()
 
-    # Formatting
-    df_sku_valid['COGS (%)'] = (df_sku_valid['Selected_COGS'] / df_sku_valid['Total_Gross_Sales']) * 100
-    df_sku_valid['Bubble_Size'] = df_sku_valid['Total_Qty'].abs().replace(0, 1)
-    df_sku_valid['Price_Increase_Label'] = np.where(df_sku_valid['Price_Increase'], 'Naik Harga', 'Harga Tetap')
-    df_sku_valid['Periode Naik Harga'] = df_sku_valid['Price_Increase_Period'].dt.strftime('%Y-%m-%d').fillna('-')
-
-    df_sku_valid['Format_Sales'] = df_sku_valid['Total_Gross_Sales'].apply(lambda x: f"Rp {x:,.0f}")
-    df_sku_valid['Format_COGS'] = df_sku_valid['Selected_COGS'].apply(lambda x: f"Rp {x:,.0f}")
-    df_sku_valid['Format_Qty'] = df_sku_valid['Total_Qty'].apply(lambda x: f"{x:,.0f} Pcs")
-
     # ==========================================
-    # SMART-SCALING & OUTLIER CONTROL
+    # SMART-SCALING & PARETO CONTROL
     # ==========================================
-    st.markdown("#### 🎚️ Smart-Scaling Control")
+    st.markdown("#### 🎚️ Smart-Scaling & Pareto Control")
 
-    col_out1, col_out2 = st.columns(2)
+    col_out1, col_out2, col_out3 = st.columns([1.5, 1.5, 1.5])
     with col_out1:
         min_outlier_limit_x = st.number_input(
             "MIN Gross Sales Limit for Average Calculation:",
@@ -237,6 +244,131 @@ try:
             help="Set < 1.0 (misal 0.2) untuk mengkompresi ruang kosong X-Axis bagian kanan."
         )
 
+    with col_out3:
+        pareto_limit = st.slider(
+            "Pareto Filter (Top % Gross Sales):",
+            min_value=10, max_value=100, value=100, step=5,
+            help="Geser ke 80% untuk membuang 'Long-Tail SKU' dan hanya menampilkan Top SKU yang menyumbang 80% omzet."
+        )
+
+    # ==========================================
+    # 🌟 DATA ENGINE: PRE & POST PARETO METRICS 🌟
+    # ==========================================
+    # 1. Simpan angka sebelum kena filter (PRE-PARETO)
+    pre_sku_count = len(df_sku_valid)
+    pre_qty = df_sku_valid['Total_Qty'].sum()
+    pre_sales = df_sku_valid['Total_Gross_Sales'].sum()
+    pre_gm = (df_sku_valid['Total_Gross_Sales'] - df_sku_valid['Total_COGS_Reg']).sum()
+    pre_gp = (df_sku_valid['Total_Gross_Sales'] - df_sku_valid['Total_COGS_All']).sum()
+
+    # 2. Terapkan Pareto Logic
+    if pareto_limit < 100:
+        df_sku_valid = df_sku_valid.sort_values('Total_Gross_Sales', ascending=False)
+        df_sku_valid['Cum_Sales'] = df_sku_valid['Total_Gross_Sales'].cumsum()
+        total_sales_valid = df_sku_valid['Total_Gross_Sales'].sum()
+        df_sku_valid['Cum_Perc'] = df_sku_valid['Cum_Sales'] / total_sales_valid
+
+        target_frac = pareto_limit / 100.0
+        df_sku_valid['Keep'] = df_sku_valid['Cum_Perc'].shift().fillna(0) < target_frac
+        df_sku_valid = df_sku_valid[df_sku_valid['Keep']].drop(columns=['Cum_Sales', 'Cum_Perc', 'Keep'])
+
+        if df_sku_valid.empty:
+            st.warning("⚠️ Pareto filter menyebabkan data kosong.")
+            st.stop()
+
+    # 3. Hitung angka setelah kena filter (POST-PARETO)
+    post_sku_count = len(df_sku_valid)
+    post_qty = df_sku_valid['Total_Qty'].sum()
+    post_sales = df_sku_valid['Total_Gross_Sales'].sum()
+    post_gm = (df_sku_valid['Total_Gross_Sales'] - df_sku_valid['Total_COGS_Reg']).sum()
+    post_gp = (df_sku_valid['Total_Gross_Sales'] - df_sku_valid['Total_COGS_All']).sum()
+
+    post_gm_ratio = (post_gm / post_sales * 100) if post_sales != 0 else 0
+    post_gp_ratio = (post_gp / post_sales * 100) if post_sales != 0 else 0
+
+
+    # Formatting Utility
+    def perc(num, den):
+        return f"{(num / den * 100):.1f}%" if den != 0 else "0.0%"
+
+
+    def fmt_bn(val):
+        return f"Rp {val / 1e9:,.1f} Bn"
+
+
+    # ==========================================
+    # 📊 PARETO ANALYSIS DASHBOARD (UI REPLICATION)
+    # ==========================================
+    html_metrics = f"""
+    <div style="margin-top: 15px; margin-bottom: 25px; font-family: sans-serif;">
+        <div style="display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 20px;">
+            <div style="flex: 1; min-width: 200px; padding: 20px; background-color: white; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #e2e8f0;">
+                <p style="margin: 0 0 5px 0; font-size: 14px; color: #475569; font-weight: 500;">Total SKUs</p>
+                <h2 style="margin: 0 0 10px 0; font-size: 32px; color: #1e293b; font-weight: 400;">{post_sku_count:,.0f}</h2>
+                <span style="font-size: 12px; color: #10b981; background-color: #d1fae5; padding: 4px 10px; border-radius: 20px; font-weight: 600;">
+                    ↑ {perc(post_sku_count, pre_sku_count)} from {pre_sku_count:,.0f} Global SKUs
+                </span>
+            </div>
+
+            <div style="flex: 1; min-width: 250px; padding: 20px; background-color: white; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #e2e8f0;">
+                <p style="margin: 0 0 5px 0; font-size: 14px; color: #475569; font-weight: 500;">Quantity</p>
+                <h2 style="margin: 0 0 10px 0; font-size: 32px; color: #1e293b; font-weight: 400;">
+                    {post_qty:,.0f} <span style="font-size: 20px; color: #64748b; font-weight: 300;">({perc(post_qty, pre_qty)})</span>
+                </h2>
+                <span style="font-size: 12px; color: #10b981; background-color: #d1fae5; padding: 4px 10px; border-radius: 20px; font-weight: 600;">
+                    ↑ {perc(post_qty, pre_qty)} from total slice
+                </span>
+            </div>
+
+            <div style="flex: 1; min-width: 250px; padding: 20px; background-color: white; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #e2e8f0;">
+                <p style="margin: 0 0 5px 0; font-size: 14px; color: #475569; font-weight: 500;">Gross Sales</p>
+                <h2 style="margin: 0 0 10px 0; font-size: 32px; color: #1e293b; font-weight: 400;">
+                    {fmt_bn(post_sales)} <span style="font-size: 20px; color: #64748b; font-weight: 300;">({perc(post_sales, pre_sales)})</span>
+                </h2>
+                <span style="font-size: 12px; color: #10b981; background-color: #d1fae5; padding: 4px 10px; border-radius: 20px; font-weight: 600;">
+                    ↑ {perc(post_sales, pre_sales)} from total slice
+                </span>
+            </div>
+        </div>
+
+        <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+            <div style="flex: 1; min-width: 250px; padding: 20px; background-color: white; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #e2e8f0;">
+                <p style="margin: 0 0 5px 0; font-size: 14px; color: #475569; font-weight: 500;">Gross Profit</p>
+                <h2 style="margin: 0 0 10px 0; font-size: 32px; color: #1e293b; font-weight: 400;">
+                    {fmt_bn(post_gp)} <span style="font-size: 20px; color: #64748b; font-weight: 300;">({perc(post_gp, pre_gp)})</span>
+                </h2>
+                <span style="font-size: 12px; color: #10b981; background-color: #d1fae5; padding: 4px 10px; border-radius: 20px; font-weight: 600;">
+                    ↑ {post_gp_ratio:.1f}% margin ratio
+                </span>
+            </div>
+
+            <div style="flex: 1; min-width: 250px; padding: 20px; background-color: white; border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); border: 1px solid #e2e8f0;">
+                <p style="margin: 0 0 5px 0; font-size: 14px; color: #475569; font-weight: 500;">Gross Margin</p>
+                <h2 style="margin: 0 0 10px 0; font-size: 32px; color: #1e293b; font-weight: 400;">
+                    {fmt_bn(post_gm)} <span style="font-size: 20px; color: #64748b; font-weight: 300;">({perc(post_gm, pre_gm)})</span>
+                </h2>
+                <span style="font-size: 12px; color: #10b981; background-color: #d1fae5; padding: 4px 10px; border-radius: 20px; font-weight: 600;">
+                    ↑ {post_gm_ratio:.1f}% margin ratio
+                </span>
+            </div>
+
+            <div style="flex: 1; min-width: 250px; padding: 20px; background-color: transparent; border: 0px;"></div>
+        </div>
+    </div>
+    """.replace('\n', '')
+
+    st.markdown(html_metrics, unsafe_allow_html=True)
+
+    # Formatting (Terapkan setelah Pareto agar kalkulasi efisien)
+    df_sku_valid['COGS (%)'] = (df_sku_valid['Selected_COGS'] / df_sku_valid['Total_Gross_Sales']) * 100
+    df_sku_valid['Bubble_Size'] = df_sku_valid['Total_Qty'].abs().replace(0, 1)
+    df_sku_valid['Price_Increase_Label'] = np.where(df_sku_valid['Price_Increase'], 'Naik Harga', 'Harga Tetap')
+    df_sku_valid['Periode Naik Harga'] = df_sku_valid['Price_Increase_Period'].dt.strftime('%Y-%m-%d').fillna('-')
+
+    df_sku_valid['Format_Sales'] = df_sku_valid['Total_Gross_Sales'].apply(lambda x: f"Rp {x:,.0f}")
+    df_sku_valid['Format_COGS'] = df_sku_valid['Selected_COGS'].apply(lambda x: f"Rp {x:,.0f}")
+    df_sku_valid['Format_Qty'] = df_sku_valid['Total_Qty'].apply(lambda x: f"{x:,.0f} Pcs")
+
     # ==========================================
     # MATRIX THRESHOLDS
     # ==========================================
@@ -249,7 +381,7 @@ try:
     if pd.isna(robust_avg_x) or robust_avg_x <= 0: robust_avg_x = 1000000.0
 
     actual_avg_y = (df_sku_valid['Selected_COGS'].sum() / df_sku_valid['Total_Gross_Sales'].sum() * 100) if \
-    df_sku_valid['Total_Gross_Sales'].sum() > 0 else df_sku_valid['COGS (%)'].mean()
+        df_sku_valid['Total_Gross_Sales'].sum() > 0 else df_sku_valid['COGS (%)'].mean()
     if pd.isna(actual_avg_y) or actual_avg_y <= 0: actual_avg_y = 50.0
 
     def_x_low = robust_avg_x * 0.66
@@ -292,17 +424,17 @@ try:
         conditions = [
             (df_target['COGS (%)'] > y_high_val) & (df_target['Total_Gross_Sales'] < x_low_val),
             (df_target['COGS (%)'] >= y_low_val) & (df_target['COGS (%)'] <= y_high_val) & (
-                        df_target['Total_Gross_Sales'] < x_low_val),
+                    df_target['Total_Gross_Sales'] < x_low_val),
             (df_target['COGS (%)'] < y_low_val) & (df_target['Total_Gross_Sales'] < x_low_val),
             (df_target['COGS (%)'] > y_high_val) & (df_target['Total_Gross_Sales'] >= x_low_val) & (
-                        df_target['Total_Gross_Sales'] <= x_high_val),
+                    df_target['Total_Gross_Sales'] <= x_high_val),
             (df_target['COGS (%)'] >= y_low_val) & (df_target['COGS (%)'] <= y_high_val) & (
-                        df_target['Total_Gross_Sales'] >= x_low_val) & (df_target['Total_Gross_Sales'] <= x_high_val),
+                    df_target['Total_Gross_Sales'] >= x_low_val) & (df_target['Total_Gross_Sales'] <= x_high_val),
             (df_target['COGS (%)'] < y_low_val) & (df_target['Total_Gross_Sales'] >= x_low_val) & (
-                        df_target['Total_Gross_Sales'] <= x_high_val),
+                    df_target['Total_Gross_Sales'] <= x_high_val),
             (df_target['COGS (%)'] > y_high_val) & (df_target['Total_Gross_Sales'] > x_high_val),
             (df_target['COGS (%)'] >= y_low_val) & (df_target['COGS (%)'] <= y_high_val) & (
-                        df_target['Total_Gross_Sales'] > x_high_val),
+                    df_target['Total_Gross_Sales'] > x_high_val),
             (df_target['COGS (%)'] < y_low_val) & (df_target['Total_Gross_Sales'] > x_high_val)
         ]
         return np.select(conditions, [b1_id, b2_id, b3_id, b4_id, b5_id, b6_id, b7_id, b8_id, b9_id], default=b5_id)
@@ -337,7 +469,7 @@ try:
     plot_y_max = max(y_max_raw, y_high_val * 1.5) + (y_span_raw * 0.05)
 
 
-    def fmt_idr(val):
+    def fmt_idr_axis(val):
         if val >= 1e9: return f"Rp{val / 1e9:,.1f}Bn"
         if val >= 1e6: return f"Rp{val / 1e6:,.0f}M"
         return f"Rp{val:,.0f}"
@@ -349,9 +481,9 @@ try:
         tot_items = sum(b_counts.values()) if custom_box_counts is not None else total_items
 
         fig.add_vline(x=apply_custom_x_scale(x_low_val), line_dash="dash", line_color="black", opacity=0.7,
-                      annotation_text=f" Low ({fmt_idr(x_low_val)})", annotation_position="top left")
+                      annotation_text=f" Low ({fmt_idr_axis(x_low_val)})", annotation_position="top left")
         fig.add_vline(x=apply_custom_x_scale(x_high_val), line_dash="dash", line_color="black", opacity=0.7,
-                      annotation_text=f" High ({fmt_idr(x_high_val)})", annotation_position="top right")
+                      annotation_text=f" High ({fmt_idr_axis(x_high_val)})", annotation_position="top right")
         fig.add_hline(y=y_low_val, line_dash="dash", line_color="black", opacity=0.7,
                       annotation_text=f"Low ({y_low_val:.1f}%)", annotation_position="bottom right")
         fig.add_hline(y=y_high_val, line_dash="dash", line_color="black", opacity=0.7,
@@ -359,7 +491,7 @@ try:
 
         # Center Line Red
         fig.add_vline(x=apply_custom_x_scale(mid_x), line_dash="dot", line_color="red", opacity=0.6,
-                      annotation_text=f" ← Center X ({fmt_idr(mid_x)})", annotation_font_color="red",
+                      annotation_text=f" ← Center X ({fmt_idr_axis(mid_x)})", annotation_font_color="red",
                       annotation_position="bottom right")
         fig.add_hline(y=mid_y, line_dash="dot", line_color="red", opacity=0.6,
                       annotation_text=f"Center Y ({mid_y:.1f}%)", annotation_position="top right",
@@ -390,9 +522,11 @@ try:
                     borderwidth=1, borderpad=4
                 )
 
+        # Append Pareto Info to Total Annotation
+        pareto_text = f"<br><span style='color:#fbbf24; font-size:11px;'><i>Pareto: {pareto_limit}%</i></span>" if pareto_limit < 100 else ""
         fig.add_annotation(
             x=0.98, y=0.98, xref="paper", yref="paper",
-            text=f"<b>TOTAL:<br>{tot_items} SKUs</b>", showarrow=False,
+            text=f"<b>TOTAL:<br>{tot_items} SKUs</b>{pareto_text}", showarrow=False,
             font=dict(size=13, color="white"), bgcolor="#374151",
             bordercolor="black", borderwidth=1, borderpad=5
         )
@@ -401,7 +535,7 @@ try:
         fig.update_xaxes(
             range=[mapped_plot_x_min, mapped_plot_x_max],
             tickvals=[apply_custom_x_scale(v) for v in ticks_x_actual],
-            ticktext=[fmt_idr(v) for v in ticks_x_actual],
+            ticktext=[fmt_idr_axis(v) for v in ticks_x_actual],
             title_text="Gross Sales Absolute (IDR)"
         )
         fig.update_yaxes(range=[plot_y_min, plot_y_max], title_text=f"{cogs_selector} (%)")
@@ -500,11 +634,11 @@ try:
 
                 def get_reason(k):
                     if k not in keys_in_raw:
-                        return "Bolos (Tidak ada transaksi di periode terpilih)"
+                        return "Bolos (Tidak ada transaksi di Market/Periode ini)"
                     elif k not in keys_in_sku_pre_filter:
                         return "Terfilter (Nilai Sales/COGS < Rp 1)"
                     else:
-                        return "Terfilter (Nilai Sales/COGS < Rp 1)"
+                        return "Dibuang oleh Pareto Filter" if pareto_limit < 100 else "Terfilter (Nilai Sales/COGS < Rp 1)"
 
 
                 missing_df['Alasan Hilang'] = missing_df['Produk_Key'].apply(get_reason)
@@ -684,7 +818,7 @@ try:
                         st.markdown("---")
                         st.markdown("#### 📉 SKU Drop-off (Hilang Setelah Naik Harga)")
                         st.caption(
-                            "Daftar SKU yang memiliki penjualan sebelum naik harga, namun **TIDAK ADA** penjualan (atau terfilter < Rp 1) setelah harga dinaikkan.")
+                            "Daftar SKU yang memiliki penjualan sebelum naik harga, namun **TIDAK ADA** penjualan (atau terfilter) setelah harga dinaikkan.")
 
                         df_lost = df_before_agg[df_before_agg['Product Name'].isin(lost_skus)].copy()
                         df_lost = df_lost[['Product Name', 'Total_Gross_Sales', 'COGS (%)', 'Dynamic 9-Box Category',
@@ -727,7 +861,7 @@ try:
 
     # Clean UI DataFrame
     drop_cols = ['Bubble_Size', 'X_Plot', 'Format_Sales', 'Format_COGS', 'Format_Qty', 'Price_Increase',
-                 'Produk_Key_Str', 'Price_Increase_Period']
+                 'Produk_Key_Str', 'Price_Increase_Period', 'Cum_Sales', 'Cum_Perc', 'Keep']
     df_display = df_sku_valid.drop(columns=[c for c in drop_cols if c in df_sku_valid.columns]).sort_values(
         'Total_Gross_Sales', ascending=False)
 
