@@ -5,7 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import io
 
-st.set_page_config(page_title="COGS 9-Box Bubble Chart", layout="wide")
+st.set_page_config(page_title="Unified 9-Box Margin Matrix", layout="wide")
 
 
 @st.cache_data(show_spinner="Optimizing & caching data into memory...")
@@ -61,8 +61,15 @@ def load_and_clean_data(file_bytes, file_name):
         s = s.str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
         return pd.to_numeric(s, errors='coerce').fillna(0.0)
 
-    for col in ['Gross Sales', 'Return', 'COGS_Regular', 'Total COGS', 'Quantity']:
-        df[col] = vectorize_clean(df[col])
+    # Menambahkan kolom-kolom baru ke dalam array proses pembersihan numerik
+    cols_to_clean = ['Gross Sales', 'Return', 'COGS_Regular', 'Total COGS', 'Quantity',
+                     'Gross Profit', 'Gross Margin', 'Contribution Margin', 'Operating Income']
+
+    for col in cols_to_clean:
+        if col in df.columns:
+            df[col] = vectorize_clean(df[col])
+        else:
+            df[col] = 0.0  # Default fallback jika tidak ada di dataset
 
     df['Market'] = df['Market'].fillna('Unknown').astype(str).str.strip()
     df['Calc_Gross_Sales'] = df['Gross Sales'] + df['Return']
@@ -75,9 +82,7 @@ def load_and_clean_data(file_bytes, file_name):
     df['YYYYMM'] = df['Date'].dt.strftime('%Y%m')
     df['Produk_Key_Str'] = df['Produk_Key'].astype(str).str.strip().str.replace(r'\.0$', '', regex=True)
 
-    # seluruh histori di file -> dipakai HANYA untuk baseline "Before Price Increase"
     df_hist = df.copy()
-    # jendela evaluasi (Monthly / YTD / Custom) tetap mulai Jan 2026 seperti sebelumnya
     df = df[df['Date'] >= '2026-01-01'].copy()
 
     return df, df_pl, has_price_data, baseline_prices, [], df_hist
@@ -88,10 +93,10 @@ st.markdown("""
                 padding: 1.2rem; border-radius: 10px; margin-bottom: 1rem; color: white;
                 text-align: center;">
         <h2 style="margin:0; color: #38bdf8; font-weight: 800;">
-            🫧 COGS (%) vs GROSS SALES 9-BOX
+            🫧 UNIFIED 9-BOX MARGIN MATRIX
         </h2>
         <p style="margin: 0.2rem 0 0 0; opacity: 0.9; font-size: 1rem;">
-            Advanced SKU Portfolio Evaluation & Price Tracking
+            Advanced SKU Portfolio Evaluation & Profitability Tracking
         </p>
     </div>
 """, unsafe_allow_html=True)
@@ -108,7 +113,7 @@ if uploaded_file is None:
     st.stop()
 
 df, df_pl, has_price_data, baseline_prices, missing_cols, df_hist = load_and_clean_data(uploaded_file.getvalue(),
-                                                                               uploaded_file.name)
+                                                                                        uploaded_file.name)
 
 if missing_cols:
     st.error(f"⚠️ Missing columns: {', '.join(missing_cols)}")
@@ -162,7 +167,9 @@ st.markdown("### ⚙️ Evaluation Settings")
 col_set1, col_set2, col_set3, col_set4 = st.columns(4)
 
 with col_set1:
-    cogs_selector = st.selectbox("Y-Axis Metric (COGS Component):", ["Total COGS", "COGS_Regular"])
+    y_metric_options = ["Gross Profit", "Gross Margin", "Contribution Margin", "Operating Profit", "Total COGS",
+                        "COGS_Regular"]
+    cogs_selector = st.selectbox("Y-Axis Metric:", y_metric_options, index=1)
 
 with col_set2:
     period_mode = st.radio("Time Evaluation Mode:", ["Monthly", "Year-to-Date (YTD)", "Custom Range"], horizontal=True)
@@ -233,25 +240,37 @@ with col_set4:
         df_filtered = df_filtered[df_filtered['Market'] == selected_market].copy()
         chart_period_title += f" | {selected_market}"
 
-# ---- histori penuh untuk baseline Before (semua transaksi di file sebelum tanggal naik SKU) ----
 df_hist_m = df_hist.copy() if selected_market == "All Markets" else df_hist[df_hist['Market'] == selected_market].copy()
 df_hist_m['Price_Increase_Flag'] = df_hist_m['Produk_Key_Str'].isin(pi_produk_keys)
 df_hist_m['Price_Increase_Period'] = df_hist_m['Produk_Key_Str'].map(pi_period_dict) if has_price_data else pd.NaT
 hist_range_lbl = (f"{df_hist['Date'].min():%b %Y} - {df_hist['Date'].max():%b %Y}") if not df_hist.empty else "-"
+
+# Dictionary mapping nama metric UI ke nama kolom df mentah
+metric_val_col_map = {
+    "Gross Profit": "Gross Profit",
+    "Gross Margin": "Gross Margin",
+    "Contribution Margin": "Contribution Margin",
+    "Operating Profit": "Operating Income",
+    "Total COGS": "Total COGS",
+    "COGS_Regular": "COGS_Regular"
+}
+
+y_val_col = metric_val_col_map[cogs_selector]
 
 df_sku = df_filtered.groupby('Produk_Key_Str').agg(
     Product_Name=('Product Name', 'first'),
     Total_Gross_Sales=('Calc_Gross_Sales', 'sum'),
     Total_COGS_Reg=('COGS_Regular', 'sum'),
     Total_COGS_All=('Total COGS', 'sum'),
-    Selected_COGS=(cogs_selector, 'sum'),
+    Selected_Metric_Val=(y_val_col, 'sum'),  # Menggunakan kolom metrik dinamis
     Total_Qty=('Quantity', 'sum'),
     Price_Increase=('Price_Increase_Flag', 'max'),
     Price_Increase_Period=('Price_Increase_Period', 'first')
 ).reset_index()
 
 df_sku.rename(columns={'Product_Name': 'Product Name'}, inplace=True)
-df_sku_valid = df_sku[(df_sku['Total_Gross_Sales'] >= 1) & (df_sku['Selected_COGS'] >= 1)].copy()
+# Filter melonggarkan batas atas nilai Selected_Metric_Val supaya margin/profit negatif tetap bisa masuk
+df_sku_valid = df_sku[(df_sku['Total_Gross_Sales'] >= 1)].copy()
 
 if df_sku_valid.empty:
     st.warning("⚠️ No valid data found for the selected Market & Period.")
@@ -334,12 +353,18 @@ html_metrics = f"""
 """.replace('\n', '')
 st.markdown(html_metrics, unsafe_allow_html=True)
 
-df_sku_valid['COGS (%)'] = (df_sku_valid['Selected_COGS'] / df_sku_valid['Total_Gross_Sales']) * 100
+y_col_dynamic = f"{cogs_selector} (%)"
+
+# Menghitung ratio persentase
+df_sku_valid[y_col_dynamic] = np.where(df_sku_valid['Total_Gross_Sales'] > 0,
+                                       (df_sku_valid['Selected_Metric_Val'] / df_sku_valid['Total_Gross_Sales']) * 100,
+                                       0.0)
+
 df_sku_valid['Bubble_Size'] = df_sku_valid['Total_Qty'].abs().replace(0, 1)
 df_sku_valid['Price_Increase_Label'] = np.where(df_sku_valid['Price_Increase'], 'Price Increased', 'Stable Price')
 df_sku_valid['Periode Naik Harga'] = df_sku_valid['Price_Increase_Period'].dt.strftime('%Y-%m-%d').fillna('-')
 df_sku_valid['Format_Sales'] = df_sku_valid['Total_Gross_Sales'].apply(lambda x: f"Rp {x:,.0f}")
-df_sku_valid['Format_COGS'] = df_sku_valid['Selected_COGS'].apply(lambda x: f"Rp {x:,.0f}")
+df_sku_valid['Format_Metric'] = df_sku_valid['Selected_Metric_Val'].apply(lambda x: f"Rp {x:,.0f}")
 df_sku_valid['Format_Qty'] = df_sku_valid['Total_Qty'].apply(lambda x: f"{x:,.0f} Pcs")
 
 st.info(
@@ -350,9 +375,11 @@ robust_avg_x = normal_x_df['Total_Gross_Sales'].mean() if not normal_x_df.empty 
     'Total_Gross_Sales'].mean()
 if pd.isna(robust_avg_x) or robust_avg_x <= 0: robust_avg_x = 1000000.0
 
-actual_avg_y = (df_sku_valid['Selected_COGS'].sum() / df_sku_valid['Total_Gross_Sales'].sum() * 100) if df_sku_valid[
-                                                                                                            'Total_Gross_Sales'].sum() > 0 else \
-df_sku_valid['COGS (%)'].mean()
+pos_y_df = df_sku_valid[df_sku_valid['Selected_Metric_Val'] >= 0]
+if not pos_y_df.empty and pos_y_df['Total_Gross_Sales'].sum() > 0:
+    actual_avg_y = (pos_y_df['Selected_Metric_Val'].sum() / pos_y_df['Total_Gross_Sales'].sum()) * 100
+else:
+    actual_avg_y = df_sku_valid[y_col_dynamic].mean()
 if pd.isna(actual_avg_y) or actual_avg_y <= 0: actual_avg_y = 50.0
 
 with st.form("cogs_threshold_form"):
@@ -361,31 +388,38 @@ with st.form("cogs_threshold_form"):
                                              step=1000000.0)
     with col_t2: x_high_val = st.number_input("X-Axis Med to High (Gross Sales)", value=float(robust_avg_x * (4 / 3)),
                                               step=1000000.0)
-    with col_t3: y_low_val = st.number_input("Y-Axis Low to Med (COGS %)", value=float(actual_avg_y * (2 / 3)),
+    with col_t3: y_low_val = st.number_input(f"Y-Axis Low to Med ({cogs_selector} %)",
+                                             value=float(actual_avg_y * (2 / 3)),
                                              step=1.0)
-    with col_t4: y_high_val = st.number_input("Y-Axis Med to High (COGS %)", value=float(actual_avg_y * (4 / 3)),
+    with col_t4: y_high_val = st.number_input(f"Y-Axis Med to High ({cogs_selector} %)",
+                                              value=float(actual_avg_y * (4 / 3)),
                                               step=1.0)
     st.form_submit_button("▶ RENDER BUBBLE CHART", type="primary")
 
 mid_x, mid_y = (x_low_val + x_high_val) / 2.0, (y_low_val + y_high_val) / 2.0
 
+is_cogs_metric = cogs_selector in ["Total COGS", "COGS_Regular"]
+
 
 def assign_9box(df_target):
+    # Logika box bergantung pada apakah metrik itu COGS (semakin kecil Y semakin bagus/hijau)
+    # atau Margin/Profit (semakin besar Y semakin bagus/hijau)
+    # Untuk penempatan visual, sumbu koordinat tetap sama (Y > high berarti ditaruh di kotak atas)
     conditions = [
-        (df_target['COGS (%)'] > y_high_val) & (df_target['Total_Gross_Sales'] < x_low_val),
-        (df_target['COGS (%)'] >= y_low_val) & (df_target['COGS (%)'] <= y_high_val) & (
+        (df_target[y_col_dynamic] > y_high_val) & (df_target['Total_Gross_Sales'] < x_low_val),
+        (df_target[y_col_dynamic] >= y_low_val) & (df_target[y_col_dynamic] <= y_high_val) & (
                     df_target['Total_Gross_Sales'] < x_low_val),
-        (df_target['COGS (%)'] < y_low_val) & (df_target['Total_Gross_Sales'] < x_low_val),
-        (df_target['COGS (%)'] > y_high_val) & (df_target['Total_Gross_Sales'] >= x_low_val) & (
+        (df_target[y_col_dynamic] < y_low_val) & (df_target['Total_Gross_Sales'] < x_low_val),
+        (df_target[y_col_dynamic] > y_high_val) & (df_target['Total_Gross_Sales'] >= x_low_val) & (
                     df_target['Total_Gross_Sales'] <= x_high_val),
-        (df_target['COGS (%)'] >= y_low_val) & (df_target['COGS (%)'] <= y_high_val) & (
+        (df_target[y_col_dynamic] >= y_low_val) & (df_target[y_col_dynamic] <= y_high_val) & (
                     df_target['Total_Gross_Sales'] >= x_low_val) & (df_target['Total_Gross_Sales'] <= x_high_val),
-        (df_target['COGS (%)'] < y_low_val) & (df_target['Total_Gross_Sales'] >= x_low_val) & (
+        (df_target[y_col_dynamic] < y_low_val) & (df_target['Total_Gross_Sales'] >= x_low_val) & (
                     df_target['Total_Gross_Sales'] <= x_high_val),
-        (df_target['COGS (%)'] > y_high_val) & (df_target['Total_Gross_Sales'] > x_high_val),
-        (df_target['COGS (%)'] >= y_low_val) & (df_target['COGS (%)'] <= y_high_val) & (
+        (df_target[y_col_dynamic] > y_high_val) & (df_target['Total_Gross_Sales'] > x_high_val),
+        (df_target[y_col_dynamic] >= y_low_val) & (df_target[y_col_dynamic] <= y_high_val) & (
                     df_target['Total_Gross_Sales'] > x_high_val),
-        (df_target['COGS (%)'] < y_low_val) & (df_target['Total_Gross_Sales'] > x_high_val)
+        (df_target[y_col_dynamic] < y_low_val) & (df_target['Total_Gross_Sales'] > x_high_val)
     ]
     return np.select(conditions, ['Box 1', 'Box 2', 'Box 3', 'Box 4', 'Box 5', 'Box 6', 'Box 7', 'Box 8', 'Box 9'],
                      default='Box 5')
@@ -401,56 +435,14 @@ def apply_custom_y_scale(v): return v if v <= y_high_val else y_high_val + (v - 
 
 
 df_sku_valid['X_Plot'] = df_sku_valid['Total_Gross_Sales'].apply(apply_custom_x_scale)
-df_sku_valid['Y_Plot'] = df_sku_valid['COGS (%)'].apply(apply_custom_y_scale)
-
-# Build full portfolio 'Before Price Increase' dataset (up to start_month_str, and < Price_Increase_Period for increased SKUs)
-mask_hist_before_all = (df_hist_m['Date'] <= before_end_date) & (
-    (~df_hist_m['Price_Increase_Flag']) | (df_hist_m['Date'] < df_hist_m['Price_Increase_Period'])
-)
-df_hist_before_all = df_hist_m[mask_hist_before_all].copy()
-
-if not df_hist_before_all.empty:
-    df_sku_before_all = df_hist_before_all.groupby('Produk_Key_Str').agg(
-        Product_Name=('Product Name', 'first'),
-        Total_Gross_Sales=('Calc_Gross_Sales', 'sum'),
-        Total_COGS_Reg=('COGS_Regular', 'sum'),
-        Total_COGS_All=('Total COGS', 'sum'),
-        Selected_COGS=(cogs_selector, 'sum'),
-        Total_Qty=('Quantity', 'sum'),
-        Price_Increase=('Price_Increase_Flag', 'max'),
-        Price_Increase_Period=('Price_Increase_Period', 'first')
-    ).reset_index()
-    df_sku_before_all.rename(columns={'Product_Name': 'Product Name'}, inplace=True)
-    df_sku_before_valid = df_sku_before_all[
-        (df_sku_before_all['Total_Gross_Sales'] >= 1) & (df_sku_before_all['Selected_COGS'] >= 1)
-    ].copy()
-    if pareto_limit < 100 and not df_sku_before_valid.empty:
-        pre_sales_bef = df_sku_before_valid['Total_Gross_Sales'].sum()
-        df_sku_before_valid = df_sku_before_valid.sort_values('Total_Gross_Sales', ascending=False)
-        df_sku_before_valid['Cum_Sales'] = df_sku_before_valid['Total_Gross_Sales'].cumsum()
-        target_frac_bef = pareto_limit / 100.0
-        df_sku_before_valid['Keep'] = (df_sku_before_valid['Cum_Sales'] / pre_sales_bef).shift().fillna(0) < target_frac_bef
-        df_sku_before_valid = df_sku_before_valid[df_sku_before_valid['Keep']].drop(columns=['Cum_Sales', 'Keep'])
-    if not df_sku_before_valid.empty:
-        df_sku_before_valid['COGS (%)'] = (df_sku_before_valid['Selected_COGS'] / df_sku_before_valid['Total_Gross_Sales']) * 100
-        df_sku_before_valid['Bubble_Size'] = df_sku_before_valid['Total_Qty'].abs().replace(0, 1)
-        df_sku_before_valid['Price_Increase_Label'] = np.where(df_sku_before_valid['Price_Increase'], 'Price Increased', 'Stable Price')
-        df_sku_before_valid['Periode Naik Harga'] = df_sku_before_valid['Price_Increase_Period'].dt.strftime('%Y-%m-%d').fillna('-')
-        df_sku_before_valid['Format_Sales'] = df_sku_before_valid['Total_Gross_Sales'].apply(lambda x: f"Rp {x:,.0f}")
-        df_sku_before_valid['Format_COGS'] = df_sku_before_valid['Selected_COGS'].apply(lambda x: f"Rp {x:,.0f}")
-        df_sku_before_valid['Format_Qty'] = df_sku_before_valid['Total_Qty'].apply(lambda x: f"{x:,.0f} Pcs")
-        df_sku_before_valid['Dynamic 9-Box Category'] = assign_9box(df_sku_before_valid)
-        df_sku_before_valid['X_Plot'] = df_sku_before_valid['Total_Gross_Sales'].apply(apply_custom_x_scale)
-        df_sku_before_valid['Y_Plot'] = df_sku_before_valid['COGS (%)'].apply(apply_custom_y_scale)
-else:
-    df_sku_before_valid = pd.DataFrame(columns=df_sku_valid.columns)
+df_sku_valid['Y_Plot'] = df_sku_valid[y_col_dynamic].apply(apply_custom_y_scale)
 
 x_min_raw, x_max_raw = df_sku_valid['Total_Gross_Sales'].min(), df_sku_valid['Total_Gross_Sales'].max()
 x_span_raw = x_max_raw - x_min_raw if x_max_raw != x_min_raw else robust_avg_x
 plot_x_min = x_min_raw - (abs(x_span_raw) * 0.05)
 plot_x_max = x_max_raw + (abs(x_span_raw) * 0.05)
 
-y_min_raw, y_max_raw = df_sku_valid['COGS (%)'].min(), df_sku_valid['COGS (%)'].max()
+y_min_raw, y_max_raw = df_sku_valid[y_col_dynamic].min(), df_sku_valid[y_col_dynamic].max()
 y_span_raw = y_max_raw - y_min_raw if y_max_raw != y_min_raw else 100.0
 plot_y_min, plot_y_max = y_min_raw - (y_span_raw * 0.05), max(y_max_raw, y_high_val * 1.5) + (y_span_raw * 0.05)
 
@@ -466,13 +458,12 @@ def display_9box_matrix(df_target):
     for b in [f'Box {i}' for i in range(1, 10)]:
         sub = df_target[df_target['Dynamic 9-Box Category'] == b]
         sales = sub['Total_Gross_Sales'].sum()
-        cogs = sub['Selected_COGS'].sum()
-        margin = sales - cogs
+        metric_val = sub['Selected_Metric_Val'].sum()
         stats[b] = {
             'count': len(sub),
             'sales': sales,
-            'margin': margin,
-            'gp': (margin / sales * 100) if sales > 0 else 0,
+            'margin': metric_val,
+            'gp': (metric_val / sales * 100) if sales > 0 else 0,
             'qty': sub['Total_Qty'].sum()
         }
 
@@ -492,10 +483,20 @@ def display_9box_matrix(df_target):
                 <span style="font-size: 28px; font-weight: 700;">{s['count']}</span> 
                 <span style="font-size: 12px; opacity: 0.9;">SKUs</span>
             </div>
-            <div style="font-size: 11px; font-weight: 600; margin-bottom: 2px;">IDR {fmt_v(s['margin'])} margin &bull; {s['gp']:.0f}% GP</div>
+            <div style="font-size: 11px; font-weight: 600; margin-bottom: 2px;">IDR {fmt_v(s['margin'])} margin &bull; {s['gp']:.0f}% Rate</div>
             <div style="font-size: 11px; opacity: 0.9;">Sales: IDR {fmt_v(s['sales'])} &bull; Qty: {s['qty']:,.0f}</div>
         </div>
         """
+
+    # Logic warna HTML box menyesuaikan metrik
+    if is_cogs_metric:
+        c_b1, c_b2, c_b3 = '#c03d32', '#d89f0e', '#319b5e'
+        c_b4, c_b5, c_b6 = '#c03d32', '#d89f0e', '#3871b6'
+        c_b7, c_b8, c_b9 = '#c03d32', '#d89f0e', '#3871b6'
+    else:
+        c_b1, c_b2, c_b3 = '#3871b6', '#d89f0e', '#c03d32'
+        c_b4, c_b5, c_b6 = '#3871b6', '#d89f0e', '#d89f0e'
+        c_b7, c_b8, c_b9 = '#319b5e', '#319b5e', '#d89f0e'
 
     html = f"""
     <div style="display: grid; grid-template-columns: 30px 70px 1fr 1fr 1fr; gap: 8px; font-family: sans-serif; margin-bottom: 10px;">
@@ -505,31 +506,31 @@ def display_9box_matrix(df_target):
         <div style="text-align: center; font-size: 12px; color: #64748b; font-weight: 600;">Sales &gt; High</div>
 
         <div style="grid-row: 2 / span 3; display: flex; align-items: center; justify-content: center;">
-            <div style="writing-mode: vertical-rl; transform: rotate(180deg); font-size: 11px; font-weight: 700; color: #64748b; letter-spacing: 2px;">COGS (%)</div>
+            <div style="writing-mode: vertical-rl; transform: rotate(180deg); font-size: 11px; font-weight: 700; color: #64748b; letter-spacing: 2px;">{cogs_selector.upper()} (%)</div>
         </div>
         <div style="display: flex; flex-direction: column; justify-content: center; align-items: flex-end; padding-right: 10px; font-size: 12px; color: #475569;">
             <span style="font-weight: 600; color:#1e293b;">High</span>
             <span>&gt;{y_high_val:.1f}%</span>
         </div>
-        {make_box('Box 1', '#c03d32')}
-        {make_box('Box 4', '#d89f0e')}
-        {make_box('Box 7', '#d89f0e')}
+        {make_box('Box 1', c_b1)}
+        {make_box('Box 4', c_b4)}
+        {make_box('Box 7', c_b7)}
 
         <div style="display: flex; flex-direction: column; justify-content: center; align-items: flex-end; padding-right: 10px; font-size: 12px; color: #475569;">
             <span style="font-weight: 600; color:#1e293b;">Med</span>
             <span>{y_low_val:.1f}-{y_high_val:.1f}%</span>
         </div>
-        {make_box('Box 2', '#d89f0e')}
-        {make_box('Box 5', '#d89f0e')}
-        {make_box('Box 8', '#319b5e')}
+        {make_box('Box 2', c_b2)}
+        {make_box('Box 5', c_b5)}
+        {make_box('Box 8', c_b8)}
 
         <div style="display: flex; flex-direction: column; justify-content: center; align-items: flex-end; padding-right: 10px; font-size: 12px; color: #475569;">
             <span style="font-weight: 600; color:#1e293b;">Low</span>
             <span>&lt;{y_low_val:.1f}%</span>
         </div>
-        {make_box('Box 3', '#3871b6')}
-        {make_box('Box 6', '#3871b6')}
-        {make_box('Box 9', '#319b5e')}
+        {make_box('Box 3', c_b3)}
+        {make_box('Box 6', c_b6)}
+        {make_box('Box 9', c_b9)}
     </div>
 
     <div style="display: flex; justify-content: center; gap: 20px; font-family: sans-serif; font-size: 12px; font-weight: 600; color: #333; margin-bottom: 20px;">
@@ -624,16 +625,25 @@ def apply_common_layout(fig, custom_box_counts=None, df_len=None, df_ref=None):
     return fig
 
 
-hover_conf = {'Format_Sales': True, 'Format_COGS': True, 'COGS (%)': ':.2f', 'Format_Qty': True,
+hover_conf = {'Format_Sales': True, 'Format_Metric': True, y_col_dynamic: ':.2f', 'Format_Qty': True,
               'Dynamic 9-Box Category': False, 'Price_Increase_Label': True, 'Bubble_Size': False, 'X_Plot': False,
               'Y_Plot': False, 'Produk_Key_Str': True}
-color_map_main = {'Box 1': '#c03d32', 'Box 2': '#d89f0e', 'Box 3': '#3871b6', 'Box 4': '#d89f0e', 'Box 5': '#d89f0e',
-                  'Box 6': '#3871b6', 'Box 7': '#d89f0e', 'Box 8': '#319b5e', 'Box 9': '#319b5e'}
+
+# Menentukan mapping warna bubble dinamis berdasarkan tipe metrik
+if is_cogs_metric:
+    color_map_main = {'Box 1': '#c03d32', 'Box 2': '#d89f0e', 'Box 3': '#319b5e',
+                      'Box 4': '#c03d32', 'Box 5': '#d89f0e', 'Box 6': '#3871b6',
+                      'Box 7': '#c03d32', 'Box 8': '#d89f0e', 'Box 9': '#3871b6'}
+else:
+    color_map_main = {'Box 1': '#3871b6', 'Box 2': '#d89f0e', 'Box 3': '#c03d32',
+                      'Box 4': '#3871b6', 'Box 5': '#d89f0e', 'Box 6': '#d89f0e',
+                      'Box 7': '#319b5e', 'Box 8': '#319b5e', 'Box 9': '#d89f0e'}
+
 
 def render_sku_details(df_source, key_suffix, file_prefix="COGS_9Box"):
     st.markdown("---")
     st.markdown("### 📋 SKU Details")
-    drop_cols = ['Bubble_Size', 'X_Plot', 'Y_Plot', 'Format_Sales', 'Format_COGS', 'Format_Qty', 'Price_Increase',
+    drop_cols = ['Bubble_Size', 'X_Plot', 'Y_Plot', 'Format_Sales', 'Format_Metric', 'Format_Qty', 'Price_Increase',
                  'Price_Increase_Period', 'Cum_Sales']
     df_display = df_source.drop(columns=[c for c in drop_cols if c in df_source.columns]).sort_values(
         'Total_Gross_Sales', ascending=False)
@@ -641,7 +651,7 @@ def render_sku_details(df_source, key_suffix, file_prefix="COGS_9Box"):
     with col_dl1:
         buffer_excel = io.BytesIO()
         with pd.ExcelWriter(buffer_excel, engine='openpyxl') as writer:
-            df_display.to_excel(writer, index=False, sheet_name='COGS_Details')
+            df_display.to_excel(writer, index=False, sheet_name='Metric_Details')
         st.download_button(
             "📥 Download Data (Excel)",
             data=buffer_excel.getvalue(),
@@ -655,26 +665,27 @@ def render_sku_details(df_source, key_suffix, file_prefix="COGS_9Box"):
             'Total_Gross_Sales': 'Rp {:,.0f}',
             'Total_COGS_Reg': 'Rp {:,.0f}',
             'Total_COGS_All': 'Rp {:,.0f}',
-            'Selected_COGS': 'Rp {:,.0f}',
-            'COGS (%)': '{:.2f}%',
+            'Selected_Metric_Val': 'Rp {:,.0f}',
+            y_col_dynamic: '{:.2f}%',
             'Total_Qty': '{:,.0f}'
         }.items() if k in df_display.columns
     }
     st.dataframe(df_display.style.format(fmt_dict), use_container_width=True, hide_index=True)
 
+
 st.markdown("---")
-tab_main, tab_pi, tab_tgt = st.tabs(["📊 Main COGS 9-Box", "📈 Price Increase Tracker", "🎯 Target SKU Intersect"])
+tab_main, tab_pi, tab_tgt = st.tabs(["📊 Main 9-Box Matrix", "📈 Price Increase Tracker", "🎯 Target SKU Intersect"])
 
 with tab_main:
     display_9box_matrix(df_sku_valid)
     fig_main = px.scatter(df_sku_valid, x='X_Plot', y='Y_Plot', size='Bubble_Size', color='Dynamic 9-Box Category',
                           color_discrete_map=color_map_main, hover_name='Product Name', hover_data=hover_conf,
-                          labels={'Format_Sales': 'Gross Sales', 'Format_COGS': cogs_selector,
+                          labels={'Format_Sales': 'Gross Sales', 'Format_Metric': cogs_selector,
                                   'Format_Qty': 'Quantity'},
                           title=f"9-Box Bubble Chart: {cogs_selector} (%) vs Gross Sales ({chart_period_title})",
                           size_max=60, render_mode='svg')
     st.plotly_chart(apply_common_layout(fig_main, df_len=len(df_sku_valid)), use_container_width=True)
-    render_sku_details(df_sku_valid, "main", "COGS_9Box_All_SKUs")
+    render_sku_details(df_sku_valid, "main", "9Box_All_SKUs")
 
 with tab_pi:
     if not has_price_data:
@@ -684,14 +695,14 @@ with tab_pi:
         fig_pi = px.scatter(df_sku_valid, x='X_Plot', y='Y_Plot', size='Bubble_Size', color='Price_Increase_Label',
                             color_discrete_map={'Price Increased': '#319b5e', 'Stable Price': '#3871b6'},
                             hover_name='Product Name', hover_data=hover_conf,
-                            labels={'Format_Sales': 'Gross Sales', 'Format_COGS': cogs_selector,
+                            labels={'Format_Sales': 'Gross Sales', 'Format_Metric': cogs_selector,
                                     'Format_Qty': 'Quantity', 'Price_Increase_Label': 'Price Status'},
                             title=f"Price Increase Tracker: {cogs_selector} (%) vs Gross Sales ({chart_period_title})",
                             size_max=60, render_mode='svg')
         fig_pi = apply_common_layout(fig_pi, df_len=len(df_sku_valid))
 
         count_naik, count_tetap = (df_sku_valid['Price_Increase_Label'] == 'Price Increased').sum(), (
-                    df_sku_valid['Price_Increase_Label'] == 'Stable Price').sum()
+                df_sku_valid['Price_Increase_Label'] == 'Stable Price').sum()
         fig_pi.add_annotation(x=0.01, y=0.98, xref="paper", yref="paper",
                               text=f"<b>Price Status:</b><br><span style='color:#319b5e'>Price Increased: {count_naik} SKUs</span><br><span style='color:#3871b6'>Stable Price: {count_tetap} SKUs</span>",
                               showarrow=False, font=dict(size=13, color="#1f2937"), bgcolor="rgba(255, 255, 255, 0.95)",
@@ -710,7 +721,7 @@ with tab_pi:
                 df_sku['Produk_Key_Str'].dropna())
             missing_df['Missing Reason'] = missing_df['Produk_Key'].apply(
                 lambda k: "Missing (No transaction)" if k not in keys_in_raw else (
-                    "Filtered (Sales/COGS < Rp 1)" if k not in keys_in_sku_pre else "Removed by Pareto Filter"))
+                    "Filtered (Sales < Rp 1)" if k not in keys_in_sku_pre else "Removed by Pareto Filter"))
 
             st.markdown(f"**⚠️ There are {len(missing_pi_keys)} Price Increased SKUs not plotted on the main chart:**")
             col_mis1, _ = st.columns([1, 4])
@@ -725,8 +736,9 @@ with tab_pi:
 
         st.markdown("---")
         st.markdown("#### 🔄 Before & After Price Increase Analysis")
-        st.caption(f"ℹ️ **Before** = histori dari awal file sampai {start_month_str} sebelum tanggal naik harga tiap SKU. "
-                   f"**After** = {chart_period_title}, mulai tanggal naik harga.")
+        st.caption(
+            f"ℹ️ **Before** = histori dari awal file sampai {start_month_str} sebelum tanggal naik harga tiap SKU. "
+            f"**After** = {chart_period_title}, mulai tanggal naik harga.")
         toggle_mode = st.radio("Select Timeline Mode:", ["Before Price Increase", "After Price Increase"],
                                horizontal=True)
 
@@ -737,23 +749,30 @@ with tab_pi:
             if df_sub.empty: return pd.DataFrame()
             d_agg = df_sub.groupby('Produk_Key_Str').agg(Product_Name=('Product Name', 'first'),
                                                          Total_Gross_Sales=('Calc_Gross_Sales', 'sum'),
-                                                         Selected_COGS=(cogs_selector, 'sum'),
+                                                         Selected_Metric_Val=(y_val_col, 'sum'),
                                                          Total_Qty=('Quantity', 'sum')).reset_index()
-            return d_agg[(d_agg['Total_Gross_Sales'] >= 1) & (d_agg['Selected_COGS'] >= 1)].rename(
+            return d_agg[(d_agg['Total_Gross_Sales'] >= 1)].rename(
                 columns={'Product_Name': 'Product Name'})
 
 
         df_pi_hist = df_hist_m[df_hist_m['Price_Increase_Flag'] == True]
-        df_before_agg = get_agg_valid(df_pi_hist[(df_pi_hist['Date'] <= before_end_date) & (df_pi_hist['Date'] < df_pi_hist['Price_Increase_Period'])])
+        df_before_agg = get_agg_valid(df_pi_hist[(df_pi_hist['Date'] <= before_end_date) & (
+                    df_pi_hist['Date'] < df_pi_hist['Price_Increase_Period'])])
         df_after_agg = get_agg_valid(df_pi_trx[df_pi_trx['Date'] >= df_pi_trx['Price_Increase_Period']])
 
         if df_before_agg.empty or df_after_agg.empty:
             st.warning("⚠️ Not enough data to perform Before-After comparison.")
         else:
             common_skus = set(df_before_agg['Produk_Key_Str']).intersection(set(df_after_agg['Produk_Key_Str']))
-            df_before_agg['COGS (%)'] = (df_before_agg['Selected_COGS'] / df_before_agg['Total_Gross_Sales']) * 100
+
+            df_before_agg[y_col_dynamic] = np.where(df_before_agg['Total_Gross_Sales'] > 0,
+                                                    (df_before_agg['Selected_Metric_Val'] / df_before_agg[
+                                                        'Total_Gross_Sales']) * 100, 0.0)
             df_before_agg['Dynamic 9-Box Category'] = assign_9box(df_before_agg)
-            df_after_agg['COGS (%)'] = (df_after_agg['Selected_COGS'] / df_after_agg['Total_Gross_Sales']) * 100
+
+            df_after_agg[y_col_dynamic] = np.where(df_after_agg['Total_Gross_Sales'] > 0,
+                                                   (df_after_agg['Selected_Metric_Val'] / df_after_agg[
+                                                       'Total_Gross_Sales']) * 100, 0.0)
             df_after_agg['Dynamic 9-Box Category'] = assign_9box(df_after_agg)
 
             df_ba = df_before_agg[
@@ -767,27 +786,30 @@ with tab_pi:
                 df_ba['Bubble_Size'] = df_ba['Total_Qty'].abs().replace(0, 1)
                 df_ba['Price_Increase_Label'] = 'Price Increased'
                 df_ba['X_Plot'] = df_ba['Total_Gross_Sales'].apply(apply_custom_x_scale)
-                df_ba['Y_Plot'] = df_ba['COGS (%)'].apply(apply_custom_y_scale)
+                df_ba['Y_Plot'] = df_ba[y_col_dynamic].apply(apply_custom_y_scale)
                 df_ba['Format_Sales'] = df_ba['Total_Gross_Sales'].apply(lambda x: f"Rp {x:,.0f}")
-                df_ba['Format_COGS'] = df_ba['Selected_COGS'].apply(lambda x: f"Rp {x:,.0f}")
+                df_ba['Format_Metric'] = df_ba['Selected_Metric_Val'].apply(lambda x: f"Rp {x:,.0f}")
                 df_ba['Format_Qty'] = df_ba['Total_Qty'].apply(lambda x: f"{x:,.0f} Pcs")
 
                 display_9box_matrix(df_ba)
                 b_counts_ba = df_ba['Dynamic 9-Box Category'].value_counts().to_dict()
                 fig_ba = px.scatter(df_ba, x='X_Plot', y='Y_Plot', size='Bubble_Size', color='Dynamic 9-Box Category',
                                     color_discrete_map=color_map_main, hover_name='Product Name', hover_data=hover_conf,
-                                    labels={'Format_Sales': 'Gross Sales', 'Format_COGS': cogs_selector},
+                                    labels={'Format_Sales': 'Gross Sales', 'Format_Metric': cogs_selector},
                                     title=f"{chart_title_ba} Matrix | Calculated Total: {len(df_ba)} Apples-to-Apples SKUs",
                                     size_max=60, render_mode='svg')
-                st.plotly_chart(apply_common_layout(fig_ba, custom_box_counts=b_counts_ba, df_len=len(df_ba), df_ref=df_ba),
+                st.plotly_chart(apply_common_layout(fig_ba, custom_box_counts=b_counts_ba, df_len=len(df_ba)),
                                 use_container_width=True)
 
                 st.markdown("#### 🧭 SKU Migration Tracker")
+                y_col_before_main = f"{y_col_dynamic} (Before)"
+                y_col_after_main = f"{y_col_dynamic} (After)"
+
                 df_migration = pd.merge(df_before_agg[df_before_agg['Produk_Key_Str'].isin(common_skus)][
-                                            ['Produk_Key_Str', 'Product Name', 'Total_Gross_Sales', 'COGS (%)',
+                                            ['Produk_Key_Str', 'Product Name', 'Total_Gross_Sales', y_col_dynamic,
                                              'Dynamic 9-Box Category']],
                                         df_after_agg[df_after_agg['Produk_Key_Str'].isin(common_skus)][
-                                            ['Produk_Key_Str', 'Total_Gross_Sales', 'COGS (%)',
+                                            ['Produk_Key_Str', 'Total_Gross_Sales', y_col_dynamic,
                                              'Dynamic 9-Box Category']], on='Produk_Key_Str',
                                         suffixes=(' (Before)', ' (After)'))
                 df_migration['Movement Status'] = df_migration.apply(
@@ -806,48 +828,33 @@ with tab_pi:
                                        file_name=f"SKU_Migration_Tracker.xlsx",
                                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                        key="btn_mig_main")
+
+                fmt_dict_mig = {'Total_Gross_Sales (Before)': 'Rp {:,.0f}', 'Total_Gross_Sales (After)': 'Rp {:,.0f}',
+                                y_col_before_main: '{:.2f}%', y_col_after_main: '{:.2f}%'}
+
                 st.dataframe(df_migration[['Produk_Key_Str', 'Product Name', 'Movement Status',
                                            'Dynamic 9-Box Category (Before)', 'Dynamic 9-Box Category (After)',
                                            'Total_Gross_Sales (Before)', 'Total_Gross_Sales (After)',
-                                           'COGS (%) (Before)', 'COGS (%) (After)']].style.format(
-                    {'Total_Gross_Sales (Before)': 'Rp {:,.0f}', 'Total_Gross_Sales (After)': 'Rp {:,.0f}',
-                     'COGS (%) (Before)': '{:.2f}%', 'COGS (%) (After)': '{:.2f}%'}), use_container_width=True,
-                             hide_index=True)
+                                           y_col_before_main, y_col_after_main]].style.format(fmt_dict_mig),
+                             use_container_width=True, hide_index=True)
 
-    render_sku_details(df_sku_valid, "pi", "COGS_9Box_Price_Tracker")
+    render_sku_details(df_sku_valid, "pi", "9Box_Price_Tracker")
 
 with tab_tgt:
     if not target_skus:
         st.warning("⚠️ Target SKU data not loaded. Please upload the Target SKU file in the uploader section above.")
     else:
-        st.markdown("### 🔀 1602 SKU View Version & Timeline Mode")
-        col_tv1, col_tv2 = st.columns([1.4, 1])
-        with col_tv1:
-            v_mode = st.radio("Select 1602 Portfolio Version: ❔", [
-                f"Versi 1: 1602 Original SKUs (Granular - {len(target_skus):,} Target SKUs)",
-                f"Versi 2: Commonized SKUs by New Code (Consolidated - {len(target_new_skus):,} Target SKUs)"
-            ], horizontal=True)
-        with col_tv2:
-            tgt_main_timeline = st.radio(
-                "Select Timeline Mode (Target SKU Intersection):",
-                ["Before Price Increase", "After Price Increase"],
-                index=1,
-                horizontal=True,
-                key="tgt_main_timeline_radio"
-            )
-        st.caption(
-            f"ℹ️ **Before Price Increase** = histori dari awal file sampai {start_month_str} (sebelum tanggal naik harga untuk SKU yang naik harga). "
-            f"**After Price Increase** = periode terpilih ({chart_period_title})."
-        )
+        st.markdown("### 🔀 1602 SKU View Version")
+        v_mode = st.radio("Select 1602 Portfolio Version: ❔", [
+            f"Versi 1: 1602 Original SKUs (Granular - {len(target_skus):,} Target SKUs)",
+            f"Versi 2: Commonized SKUs by New Code (Consolidated - {len(target_new_skus):,} Target SKUs)"
+        ], horizontal=True)
         st.markdown("---")
 
-        base_df_for_tgt = df_sku_before_valid if "Before" in tgt_main_timeline else df_sku_valid
-        tgt_timeline_label = f"BEFORE Price Increase (Up to {start_month_str})" if "Before" in tgt_main_timeline else f"AFTER Price Increase ({chart_period_title})"
-
         if "Versi 1" in v_mode:
-            df_target_intersect = base_df_for_tgt[base_df_for_tgt['Produk_Key_Str'].isin(target_skus)].copy()
+            df_target_intersect = df_sku_valid[df_sku_valid['Produk_Key_Str'].isin(target_skus)].copy()
         else:
-            df_tgt_raw = base_df_for_tgt[base_df_for_tgt['Produk_Key_Str'].isin(target_skus)].copy()
+            df_tgt_raw = df_sku_valid[df_sku_valid['Produk_Key_Str'].isin(target_skus)].copy()
             df_tgt_raw['Commonized_Key'] = df_tgt_raw['Produk_Key_Str'].map(target_mapping).fillna(
                 df_tgt_raw['Produk_Key_Str'])
 
@@ -856,7 +863,7 @@ with tab_tgt:
                 Total_Gross_Sales=('Total_Gross_Sales', 'sum'),
                 Total_COGS_Reg=('Total_COGS_Reg', 'sum'),
                 Total_COGS_All=('Total_COGS_All', 'sum'),
-                Selected_COGS=('Selected_COGS', 'sum'),
+                Selected_Metric_Val=('Selected_Metric_Val', 'sum'),
                 Total_Qty=('Total_Qty', 'sum'),
                 Price_Increase=('Price_Increase', 'max'),
                 Price_Increase_Period=('Price_Increase_Period', 'min')
@@ -869,19 +876,25 @@ with tab_tgt:
                 df_target_intersect['Product Name'] = df_target_intersect['First_Product_Name']
             df_target_intersect.drop(columns=['First_Product_Name'], inplace=True, errors='ignore')
 
-            df_target_intersect['COGS (%)'] = (df_target_intersect['Selected_COGS'] / df_target_intersect[
-                'Total_Gross_Sales']) * 100
+            df_target_intersect[y_col_dynamic] = np.where(df_target_intersect['Total_Gross_Sales'] > 0,
+                                                          (df_target_intersect['Selected_Metric_Val'] /
+                                                           df_target_intersect['Total_Gross_Sales']) * 100,
+                                                          0.0)
+
             df_target_intersect['Bubble_Size'] = df_target_intersect['Total_Qty'].abs().replace(0, 1)
             df_target_intersect['Dynamic 9-Box Category'] = assign_9box(df_target_intersect)
             df_target_intersect['X_Plot'] = df_target_intersect['Total_Gross_Sales'].apply(apply_custom_x_scale)
-            df_target_intersect['Y_Plot'] = df_target_intersect['COGS (%)'].apply(apply_custom_y_scale)
+            df_target_intersect['Y_Plot'] = df_target_intersect[y_col_dynamic].apply(apply_custom_y_scale)
 
             df_target_intersect['Format_Sales'] = df_target_intersect['Total_Gross_Sales'].apply(
                 lambda x: f"Rp {x:,.0f}")
-            df_target_intersect['Format_COGS'] = df_target_intersect['Selected_COGS'].apply(lambda x: f"Rp {x:,.0f}")
+            df_target_intersect['Format_Metric'] = df_target_intersect['Selected_Metric_Val'].apply(
+                lambda x: f"Rp {x:,.0f}")
             df_target_intersect['Format_Qty'] = df_target_intersect['Total_Qty'].apply(lambda x: f"{x:,.0f} Pcs")
-            df_target_intersect['Price_Increase_Label'] = np.where(df_target_intersect['Price_Increase'], 'Price Increased', 'Stable Price')
-            df_target_intersect['Periode Naik Harga'] = df_target_intersect['Price_Increase_Period'].dt.strftime('%Y-%m-%d').fillna('-')
+            df_target_intersect['Price_Increase_Label'] = np.where(df_target_intersect['Price_Increase'],
+                                                                   'Price Increased', 'Stable Price')
+            df_target_intersect['Periode Naik Harga'] = df_target_intersect['Price_Increase_Period'].dt.strftime(
+                '%Y-%m-%d').fillna('-')
             df_target_intersect.rename(columns={'Commonized_Key': 'Produk_Key_Str'}, inplace=True)
 
         if df_target_intersect.empty:
@@ -890,14 +903,25 @@ with tab_tgt:
         else:
             display_9box_matrix(df_target_intersect)
             b_counts_tgt = df_target_intersect['Dynamic 9-Box Category'].value_counts().to_dict()
+
+            # Fix warna legend untuk Commonized View khusus tab Target SKU
+            tgt_color_map = color_map_main.copy()
+            tgt_color_map['Commonized SKU (Black)'] = '#000000'
+
+            df_target_intersect['Plot_Color_Category'] = df_target_intersect['Dynamic 9-Box Category']
+            if "Versi 2" in v_mode:
+                df_target_intersect.loc[df_target_intersect['Product Name'].fillna('').astype(str).str.startswith(
+                    'C-'), 'Plot_Color_Category'] = 'Commonized SKU (Black)'
+
             fig_tgt = px.scatter(df_target_intersect, x='X_Plot', y='Y_Plot', size='Bubble_Size',
-                                 color='Dynamic 9-Box Category', color_discrete_map=color_map_main,
+                                 color='Plot_Color_Category', color_discrete_map=tgt_color_map,
                                  hover_name='Product Name', hover_data=hover_conf,
-                                 labels={'Format_Sales': 'Gross Sales', 'Format_COGS': cogs_selector,
+                                 labels={'Format_Sales': 'Gross Sales', 'Format_Metric': cogs_selector,
                                          'Format_Qty': 'Quantity', 'Price_Increase_Label': 'Price Status'},
-                                 title=f"Target SKU Intersection ({tgt_timeline_label}): {len(df_target_intersect)} SKUs matched", size_max=60,
+                                 title=f"Target SKU Intersection: {len(df_target_intersect)} SKUs matched", size_max=60,
                                  render_mode='svg')
-            fig_tgt = apply_common_layout(fig_tgt, custom_box_counts=b_counts_tgt, df_len=len(df_target_intersect), df_ref=df_target_intersect)
+            fig_tgt = apply_common_layout(fig_tgt, custom_box_counts=b_counts_tgt, df_len=len(df_target_intersect),
+                                          df_ref=df_target_intersect)
             if has_price_data:
                 cnt_naik_tgt = int((df_target_intersect['Price_Increase_Label'] == 'Price Increased').sum())
                 cnt_tetap_tgt = int((df_target_intersect['Price_Increase_Label'] == 'Stable Price').sum())
@@ -911,8 +935,9 @@ with tab_tgt:
 
             st.markdown("---")
             st.markdown("#### 🔄 Before & After Price Increase Analysis (Target SKUs)")
-            st.caption(f"ℹ️ **Before** = histori dari awal file sampai {start_month_str} sebelum tanggal naik harga tiap SKU. "
-                       f"**After** = {chart_period_title}, mulai tanggal naik harga.")
+            st.caption(
+                f"ℹ️ **Before** = histori dari awal file sampai {start_month_str} sebelum tanggal naik harga tiap SKU. "
+                f"**After** = {chart_period_title}, mulai tanggal naik harga.")
             toggle_mode_tgt = st.radio("Select Timeline Mode:", ["Before Price Increase", "After Price Increase"],
                                        horizontal=True, key="toggle_tgt_ba")
 
@@ -930,10 +955,10 @@ with tab_tgt:
 
                 d_agg = df_r.groupby('Agg_Key').agg(
                     Total_Gross_Sales=('Calc_Gross_Sales', 'sum'),
-                    Selected_COGS=(cogs_selector, 'sum'),
+                    Selected_Metric_Val=(y_val_col, 'sum'),
                     Total_Qty=('Quantity', 'sum')
                 ).reset_index()
-                d_agg = d_agg[(d_agg['Total_Gross_Sales'] >= 1) & (d_agg['Selected_COGS'] >= 1)].copy()
+                d_agg = d_agg[(d_agg['Total_Gross_Sales'] >= 1)].copy()
 
                 if "Versi 1" in v_mode:
                     name_dict = df_sku.set_index('Produk_Key_Str')['Product Name'].to_dict()
@@ -949,9 +974,11 @@ with tab_tgt:
                 return d_agg
 
 
-            df_pi_hist_tgt = df_hist_m[(df_hist_m['Price_Increase_Flag'] == True) & (df_hist_m['Produk_Key_Str'].isin(target_skus))]
+            df_pi_hist_tgt = df_hist_m[
+                (df_hist_m['Price_Increase_Flag'] == True) & (df_hist_m['Produk_Key_Str'].isin(target_skus))]
             df_tgt_before_agg = get_tgt_agg_valid(
-                df_pi_hist_tgt[(df_pi_hist_tgt['Date'] <= before_end_date) & (df_pi_hist_tgt['Date'] < df_pi_hist_tgt['Price_Increase_Period'])])
+                df_pi_hist_tgt[(df_pi_hist_tgt['Date'] <= before_end_date) & (
+                            df_pi_hist_tgt['Date'] < df_pi_hist_tgt['Price_Increase_Period'])])
             df_tgt_after_agg = get_tgt_agg_valid(
                 df_pi_trx_tgt[df_pi_trx_tgt['Date'] >= df_pi_trx_tgt['Price_Increase_Period']])
 
@@ -961,11 +988,16 @@ with tab_tgt:
                 common_tgt_skus = set(df_tgt_before_agg['Produk_Key_Str']).intersection(
                     set(df_tgt_after_agg['Produk_Key_Str']))
 
-                df_tgt_before_agg['COGS (%)'] = (df_tgt_before_agg['Selected_COGS'] / df_tgt_before_agg[
-                    'Total_Gross_Sales']) * 100
+                df_tgt_before_agg[y_col_dynamic] = np.where(df_tgt_before_agg['Total_Gross_Sales'] > 0,
+                                                            (df_tgt_before_agg['Selected_Metric_Val'] /
+                                                             df_tgt_before_agg['Total_Gross_Sales']) * 100,
+                                                            0.0)
                 df_tgt_before_agg['Dynamic 9-Box Category'] = assign_9box(df_tgt_before_agg)
-                df_tgt_after_agg['COGS (%)'] = (df_tgt_after_agg['Selected_COGS'] / df_tgt_after_agg[
-                    'Total_Gross_Sales']) * 100
+
+                df_tgt_after_agg[y_col_dynamic] = np.where(df_tgt_after_agg['Total_Gross_Sales'] > 0,
+                                                           (df_tgt_after_agg['Selected_Metric_Val'] / df_tgt_after_agg[
+                                                               'Total_Gross_Sales']) * 100,
+                                                           0.0)
                 df_tgt_after_agg['Dynamic 9-Box Category'] = assign_9box(df_tgt_after_agg)
 
                 df_ba_tgt = df_tgt_before_agg[df_tgt_before_agg['Produk_Key_Str'].isin(
@@ -979,31 +1011,42 @@ with tab_tgt:
                     df_ba_tgt['Bubble_Size'] = df_ba_tgt['Total_Qty'].abs().replace(0, 1)
                     df_ba_tgt['Price_Increase_Label'] = 'Price Increased'
                     df_ba_tgt['X_Plot'] = df_ba_tgt['Total_Gross_Sales'].apply(apply_custom_x_scale)
-                    df_ba_tgt['Y_Plot'] = df_ba_tgt['COGS (%)'].apply(apply_custom_y_scale)
+                    df_ba_tgt['Y_Plot'] = df_ba_tgt[y_col_dynamic].apply(apply_custom_y_scale)
                     df_ba_tgt['Format_Sales'] = df_ba_tgt['Total_Gross_Sales'].apply(lambda x: f"Rp {x:,.0f}")
-                    df_ba_tgt['Format_COGS'] = df_ba_tgt['Selected_COGS'].apply(lambda x: f"Rp {x:,.0f}")
+                    df_ba_tgt['Format_Metric'] = df_ba_tgt['Selected_Metric_Val'].apply(lambda x: f"Rp {x:,.0f}")
                     df_ba_tgt['Format_Qty'] = df_ba_tgt['Total_Qty'].apply(lambda x: f"{x:,.0f} Pcs")
 
                     display_9box_matrix(df_ba_tgt)
                     b_counts_ba_tgt = df_ba_tgt['Dynamic 9-Box Category'].value_counts().to_dict()
+
+                    df_ba_tgt['Plot_Color_Category'] = df_ba_tgt['Dynamic 9-Box Category']
+                    if "Versi 2" in v_mode:
+                        df_ba_tgt.loc[df_ba_tgt['Product Name'].fillna('').astype(str).str.startswith(
+                            'C-'), 'Plot_Color_Category'] = 'Commonized SKU (Black)'
+
                     fig_ba_tgt = px.scatter(df_ba_tgt, x='X_Plot', y='Y_Plot', size='Bubble_Size',
-                                            color='Dynamic 9-Box Category', color_discrete_map=color_map_main,
+                                            color='Plot_Color_Category', color_discrete_map=tgt_color_map,
                                             hover_name='Product Name', hover_data=hover_conf,
-                                            labels={'Format_Sales': 'Gross Sales', 'Format_COGS': cogs_selector},
+                                            labels={'Format_Sales': 'Gross Sales', 'Format_Metric': cogs_selector},
                                             title=f"{chart_title_ba_tgt} Matrix | Target SKUs: {len(df_ba_tgt)} Apples-to-Apples",
                                             size_max=60, render_mode='svg')
                     st.plotly_chart(
-                        apply_common_layout(fig_ba_tgt, custom_box_counts=b_counts_ba_tgt, df_len=len(df_ba_tgt), df_ref=df_ba_tgt),
+                        apply_common_layout(fig_ba_tgt, custom_box_counts=b_counts_ba_tgt, df_len=len(df_ba_tgt)),
                         use_container_width=True)
 
                     st.markdown("#### 🧭 Target SKU Migration Tracker")
+
+                    y_col_before_tgt = f"{y_col_dynamic} (Before)"
+                    y_col_after_tgt = f"{y_col_dynamic} (After)"
+
                     df_migration_tgt = pd.merge(
                         df_tgt_before_agg[df_tgt_before_agg['Produk_Key_Str'].isin(common_tgt_skus)][
-                            ['Produk_Key_Str', 'Product Name', 'Total_Gross_Sales', 'COGS (%)',
+                            ['Produk_Key_Str', 'Product Name', 'Total_Gross_Sales', y_col_dynamic,
                              'Dynamic 9-Box Category']],
                         df_tgt_after_agg[df_tgt_after_agg['Produk_Key_Str'].isin(common_tgt_skus)][
-                            ['Produk_Key_Str', 'Total_Gross_Sales', 'COGS (%)', 'Dynamic 9-Box Category']],
+                            ['Produk_Key_Str', 'Total_Gross_Sales', y_col_dynamic, 'Dynamic 9-Box Category']],
                         on='Produk_Key_Str', suffixes=(' (Before)', ' (After)'))
+
                     df_migration_tgt['Movement Status'] = df_migration_tgt.apply(
                         lambda r: f"Stays in Box {r['Dynamic 9-Box Category (Before)'].split(' ')[1]}" if r[
                                                                                                               'Dynamic 9-Box Category (Before)'] ==
@@ -1020,12 +1063,15 @@ with tab_tgt:
                                            file_name=f"Target_SKU_Migration_Tracker.xlsx",
                                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                            key="btn_mig_tgt")
+
+                    fmt_dict_mig_tgt = {'Total_Gross_Sales (Before)': 'Rp {:,.0f}',
+                                        'Total_Gross_Sales (After)': 'Rp {:,.0f}',
+                                        y_col_before_tgt: '{:.2f}%', y_col_after_tgt: '{:.2f}%'}
+
                     st.dataframe(df_migration_tgt[['Produk_Key_Str', 'Product Name', 'Movement Status',
                                                    'Dynamic 9-Box Category (Before)', 'Dynamic 9-Box Category (After)',
                                                    'Total_Gross_Sales (Before)', 'Total_Gross_Sales (After)',
-                                                   'COGS (%) (Before)', 'COGS (%) (After)']].style.format(
-                        {'Total_Gross_Sales (Before)': 'Rp {:,.0f}', 'Total_Gross_Sales (After)': 'Rp {:,.0f}',
-                         'COGS (%) (Before)': '{:.2f}%', 'COGS (%) (After)': '{:.2f}%'}), use_container_width=True,
-                                 hide_index=True)
+                                                   y_col_before_tgt, y_col_after_tgt]].style.format(fmt_dict_mig_tgt),
+                                 use_container_width=True, hide_index=True)
 
-            render_sku_details(df_target_intersect, "tgt", "COGS_9Box_Target_SKU_Intersect")
+            render_sku_details(df_target_intersect, "tgt", "9Box_Target_SKU_Intersect")
